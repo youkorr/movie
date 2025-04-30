@@ -15,6 +15,8 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional('display_height', default=240): cv.int_,
     cv.Optional('buffer_size', default=8192): cv.int_,
     cv.Optional('fps', default=15): cv.int_,
+    cv.Optional('http_timeout', default=5000): cv.int_,
+    cv.Optional('http_buffer_size', default=4096): cv.int_,
 }).extend(cv.COMPONENT_SCHEMA)
 
 async def to_code(config):
@@ -25,3 +27,6 @@ async def to_code(config):
     cg.add(var.set_display_height(config['display_height']))
     cg.add(var.set_buffer_size(config['buffer_size']))
     cg.add(var.set_fps(config['fps']))
+    cg.add(var.set_http_timeout(config['http_timeout']))
+    cg.add(var.set_http_buffer_size(config['http_buffer_size']))
+

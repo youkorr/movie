@@ -1,5 +1,6 @@
 #include "movie.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"  // Pour accéder à la liste des écrans
 #include "esp_system.h"
 #include "esp_timer.h"
 #include <string.h>
@@ -9,48 +10,32 @@ static const char *TAG = "movie";
 namespace esphome {
 namespace movie {
 
-// Implémentation de notre propre décodeur JPEG
+// Implémentation simplifiée du décodeur JPEG
 bool decode_jpeg(uint8_t *jpeg_data, size_t jpeg_len, uint16_t *rgb565_buffer, int width, int height) {
-    // Implémentation simplifiée de décodage JPEG
-    // Cette fonction est une alternative à esp_jpg_decode.h
-    
     // Vérifier que nous avons bien un JPEG (signature FF D8)
     if (jpeg_len < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
         ESP_LOGE(TAG, "Not a valid JPEG file (missing SOI marker)");
         return false;
     }
     
-    // Cette implémentation est simplifiée
-    // Dans un cas réel, nous utiliserions une bibliothèque comme TJpgDec ou libjpeg-turbo
-    
-    // Pour cet exemple, nous allons simplement convertir la luminosité des pixels de l'image
-    // en une grille basique pour montrer que quelque chose est affiché
-    
-    // Remplir le buffer avec un motif de test
+    // Implémentation simplifiée pour exemple
+    // Remplir avec des motifs basés sur les données JPEG
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            // Calculer un motif basé sur les premiers octets du JPEG et la position
-            int offset = (y * width + x) % (jpeg_len - 10);
+            int offset = ((y * width + x) * 3) % (jpeg_len - 10);
             if (offset < 0) offset = 0;
             
-            uint8_t value = jpeg_data[offset + 10];
+            uint8_t r = jpeg_data[offset % jpeg_len];
+            uint8_t g = jpeg_data[(offset + 1) % jpeg_len];
+            uint8_t b = jpeg_data[(offset + 2) % jpeg_len];
             
-            // Convertir en RGB565
-            uint16_t color;
-            if ((x / 8) % 2 == (y / 8) % 2) {
-                // Motif en damier avec des couleurs dérivées des données JPEG
-                uint8_t r = value & 0x1F;
-                uint8_t g = (value >> 2) & 0x3F;
-                uint8_t b = (value >> 5) & 0x1F;
-                
-                // RGB565 : RRRRRGGG GGGBBBBB
-                color = (r << 11) | (g << 5) | b;
-            } else {
-                // Autre partie du damier
-                color = 0;
-            }
+            // Réduire à 5/6/5 bits
+            r = r >> 3;
+            g = g >> 2;
+            b = b >> 3;
             
-            rgb565_buffer[y * width + x] = color;
+            // Assembler en RGB565
+            rgb565_buffer[y * width + x] = (r << 11) | (g << 5) | b;
         }
     }
     
@@ -88,7 +73,8 @@ MoviePlayer::~MoviePlayer() {
 
 void MoviePlayer::setup() {
   // Trouver l'écran actif dans ESPHome
-  for (auto *display : display::DisplayBuffer::displays) {
+  // Correction: utilisation de App->get_displays()
+  for (auto *display : App.get_displays()) {
     if (display != nullptr) {
       this->display_ = display;
       ESP_LOGI(TAG, "Found display: %dx%d", display->get_width(), display->get_height());
@@ -541,7 +527,7 @@ bool MoviePlayer::read_next_frame() {
   if (this->current_source_ == SOURCE_LOCAL_FILE) {
     switch (this->current_format_) {
       case VIDEO_FORMAT_MJPEG:
-        return this->decode_mjpeg_frame();
+        return this->decode_mjpeg_frame(this->frame_buffer_, this->buffer_size_);
       default:
         return false;
     }
@@ -562,54 +548,23 @@ bool MoviePlayer::read_next_frame() {
       return false;
     }
     
-    // Décoder directement avec notre propre fonction
-    return decode_jpeg_frame(this->http_buffer_, this->http_data_received_);
+    // Décoder les données
+    return this->decode_jpeg_frame(this->http_buffer_, this->http_data_received_);
   }
   
   return false;
 }
 
-bool MoviePlayer::decode_jpeg_frame() {
-  if (this->video_file_ == nullptr || this->frame_buffer_ == nullptr) {
-    return false;
-  }
-  
-  // Recherche du marqueur de début JPEG
-  uint8_t marker[2];
-  bool found_start = false;
-  while (!found_start && !feof(this->video_file_)) {
-    size_t read = fread(marker, 1, 2, this->video_file_);
-    if (read != 2) break;
-    
-    if (marker[0] == 0xFF && marker[1] == 0xD8) {
-      // Trouvé un début de JPEG
-      found_start = true;
-      fseek(this->video_file_, -2, SEEK_CUR);  // Revenir au début du marqueur
-    } else {
-      fseek(this->video_file_, -1, SEEK_CUR);  // Reculer d'un octet et réessayer
-    }
-  }
-  
-  if (!found_start) {
-    ESP_LOGI(TAG, "No more JPEG frames found");
-    return false;
-  }
-  
-  // Lire la frame JPEG dans le buffer
-  size_t bytes_read = fread(this->frame_buffer_, 1, this->buffer_size_, this->video_file_);
-  if (bytes_read == 0) {
-    ESP_LOGE(TAG, "Failed to read JPEG data");
-    return false;
-  }
-  
-  // Utiliser notre fonction de décodage JPEG
-  return decode_jpeg_frame(this->frame_buffer_, bytes_read);
-}
-
 bool MoviePlayer::decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len) {
-  // Utiliser notre fonction de décodage
+  if (!jpeg_data || jpeg_len == 0 || !this->rgb565_buffer_) {
+    return false;
+  }
+
+  // Utiliser notre fonction de décodage JPEG
   return decode_jpeg(jpeg_data, jpeg_len, this->rgb565_buffer_, this->width_, this->height_);
 }
+
+// Suppression de la méthode decode_jpeg_frame() sans paramètres qui causait l'erreur
 
 bool MoviePlayer::render_current_frame() {
   if (this->display_ == nullptr || this->rgb565_buffer_ == nullptr) {
@@ -623,7 +578,7 @@ bool MoviePlayer::render_current_frame() {
   }
   
   // Convertir RGB565 au format de l'écran et afficher
-  this->display_rgb565_frame(this->rgb565_buffer_, this->width_, this->height_);
+  this->display_rgb565_frame(this->rgb565_buffer_, this->frame_data_.width, this->frame_data_.height);
   
   // Libérer le mutex
   xSemaphoreGive(this->mutex_);
@@ -646,7 +601,7 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
   // Pour cet exemple, nous allons convertir les pixels RGB565 en pixels binaires pour un affichage monochrome
   // Si vous utilisez un écran couleur, vous devrez adapter cette méthode
   
-  this->display_->fill(display::COLOR_OFF);
+  this->display_->fill(COLOR_OFF);  // Correction: enlever le préfixe display::
   
   // Calculer les facteurs de mise à l'échelle si nécessaire
   float scale_x = (float)this->display_->get_width() / width;
@@ -666,7 +621,7 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
       uint8_t luminance = (r * 3 + g * 6 + b * 1) / 10;
       
       // Convertir en binaire avec seuil
-      display::Color color = (luminance > 16) ? display::COLOR_ON : display::COLOR_OFF;
+      Color color = (luminance > 16) ? COLOR_ON : COLOR_OFF;  // Correction: enlever le préfixe display::
       
       // Position sur l'écran (avec mise à l'échelle si nécessaire)
       int display_x = x * scale_x;
@@ -683,4 +638,5 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
 
 }  // namespace movie
 }  // namespace esphome
+
 

@@ -11,8 +11,9 @@
 // Remplacer l'inclusion de i2s déprécié
 #include "driver/i2s_std.h"
 #include "esp_spiffs.h"
-// Résoudre l'erreur de esp_jpg_decode.h en utilisant les bibliothèques JPEG disponibles
-#include "esp_jpeg/include/esp_jpg_decode.h" // Certains ESP-IDF
+
+#include <esp_jpg_decode.h>
+
 #include "libjpeg-turbo/include/jpeglib.h"   // Alternative si la première ne fonctionne pas
 #include "esp_http_client.h"
 #include <string>

@@ -2,6 +2,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/display/display_buffer.h"
+#include "esphome/core/application.h"  // Pour App
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -82,7 +83,8 @@ class MoviePlayer : public Component {
   
   // Méthodes spécifiques au format MJPEG
   bool init_mjpeg();
-  bool decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len);  // Correction: ajout des paramètres
+  bool read_mjpeg_frame();  // Ajouté cette méthode
+  bool decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len);
   
   // Méthodes HTTP
   bool init_http_client(const std::string &url);
@@ -150,5 +152,6 @@ class MoviePlayer : public Component {
 
 }  // namespace movie
 }  // namespace esphome
+
 
 

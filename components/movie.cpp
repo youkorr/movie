@@ -30,6 +30,11 @@ MoviePlayer::~MoviePlayer() {
     this->frame_buffer_ = nullptr;
   }
   
+  if (this->http_buffer_ != nullptr) {
+    heap_caps_free(this->http_buffer_);
+    this->http_buffer_ = nullptr;
+  }
+  
   if (this->rgb565_buffer_ != nullptr) {
     heap_caps_free(this->rgb565_buffer_);
     this->rgb565_buffer_ = nullptr;
@@ -56,6 +61,14 @@ void MoviePlayer::setup() {
   this->frame_buffer_ = (uint8_t *)heap_caps_malloc(this->buffer_size_, MALLOC_CAP_SPIRAM);
   if (this->frame_buffer_ == nullptr) {
     ESP_LOGE(TAG, "Failed to allocate frame buffer memory");
+    this->mark_failed();
+    return;
+  }
+
+  // Allouer le buffer HTTP
+  this->http_buffer_ = (uint8_t *)heap_caps_malloc(this->http_buffer_size_, MALLOC_CAP_SPIRAM);
+  if (this->http_buffer_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate HTTP buffer memory");
     this->mark_failed();
     return;
   }
@@ -120,6 +133,8 @@ void MoviePlayer::dump_config() {
   ESP_LOGCONFIG(TAG, "  Display Size: %dx%d", this->width_, this->height_);
   ESP_LOGCONFIG(TAG, "  Buffer Size: %d bytes", this->buffer_size_);
   ESP_LOGCONFIG(TAG, "  Target FPS: %d", this->fps_);
+  ESP_LOGCONFIG(TAG, "  HTTP Timeout: %d ms", this->http_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  HTTP Buffer Size: %d bytes", this->http_buffer_size_);
 }
 
 bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
@@ -128,9 +143,10 @@ bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
     this->stop();
   }
 
-  ESP_LOGI(TAG, "Starting playback of '%s'", file_path.c_str());
-  this->current_file_ = file_path;
+  ESP_LOGI(TAG, "Starting playback of local file: '%s'", file_path.c_str());
+  this->current_path_ = file_path;
   this->current_format_ = format;
+  this->current_source_ = SOURCE_LOCAL_FILE;
   
   // Ouvrir le fichier vidéo
   if (!this->open_file(file_path)) {
@@ -165,6 +181,46 @@ bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
   return true;
 }
 
+bool MoviePlayer::play_http_stream(const std::string &url, VideoFormat format) {
+  if (this->playing_) {
+    ESP_LOGW(TAG, "Already playing a video, stopping current playback");
+    this->stop();
+  }
+
+  ESP_LOGI(TAG, "Starting playback from HTTP stream: '%s'", url.c_str());
+  this->current_path_ = url;
+  this->current_format_ = format;
+  this->current_source_ = SOURCE_HTTP_STREAM;
+  
+  // Réinitialiser l'état de lecture
+  this->stop_requested_ = false;
+  this->playing_ = true;
+  this->current_frame_ = 0;
+  this->http_data_ready_ = false;
+  this->http_content_length_ = 0;
+  this->http_data_received_ = 0;
+  
+  // Créer la tâche de décodage
+  ESP_LOGI(TAG, "Creating decoder task for HTTP stream");
+  BaseType_t res = xTaskCreatePinnedToCore(
+    MoviePlayer::decoder_task,
+    "movie_decoder",
+    8192,        // Stack size
+    this,        // Task parameter
+    tskIDLE_PRIORITY + 1,  // Priority
+    &this->decoder_task_handle_,
+    1           // Core ID (APP_CPU)
+  );
+  
+  if (res != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create decoder task: %d", res);
+    this->playing_ = false;
+    return false;
+  }
+  
+  return true;
+}
+
 void MoviePlayer::stop() {
   if (!this->playing_) {
     return;
@@ -183,7 +239,12 @@ void MoviePlayer::stop() {
     this->decoder_task_handle_ = nullptr;
   }
   
-  this->close_file();
+  if (this->current_source_ == SOURCE_LOCAL_FILE) {
+    this->close_file();
+  } else if (this->current_source_ == SOURCE_HTTP_STREAM) {
+    this->cleanup_http_client();
+  }
+  
   this->cleanup_decoder();
   this->playing_ = false;
 }
@@ -211,6 +272,105 @@ void MoviePlayer::close_file() {
   }
 }
 
+bool MoviePlayer::init_http_client(const std::string &url) {
+  esp_http_client_config_t config = {
+    .url = url.c_str(),
+    .event_handler = MoviePlayer::http_event_handler,
+    .user_data = this,
+    .timeout_ms = this->http_timeout_ms_,
+  };
+  
+  this->http_client_ = esp_http_client_init(&config);
+  if (this->http_client_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to initialize HTTP client");
+    return false;
+  }
+  
+  ESP_LOGI(TAG, "HTTP client initialized for URL: %s", url.c_str());
+  return true;
+}
+
+void MoviePlayer::cleanup_http_client() {
+  if (this->http_client_ != nullptr) {
+    esp_http_client_cleanup(this->http_client_);
+    this->http_client_ = nullptr;
+  }
+}
+
+esp_err_t MoviePlayer::http_event_handler(esp_http_client_event_t *evt) {
+  MoviePlayer *player = static_cast<MoviePlayer *>(evt->user_data);
+  
+  switch (evt->event_id) {
+    case HTTP_EVENT_ERROR:
+      ESP_LOGE(TAG, "HTTP_EVENT_ERROR");
+      break;
+    case HTTP_EVENT_ON_CONNECTED:
+      ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+      break;
+    case HTTP_EVENT_HEADER_SENT:
+      ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+      break;
+    case HTTP_EVENT_ON_HEADER:
+      ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+      if (strcasecmp(evt->header_key, "Content-Length") == 0) {
+        player->http_content_length_ = atoi(evt->header_value);
+        ESP_LOGI(TAG, "Content length: %d", player->http_content_length_);
+      }
+      break;
+    case HTTP_EVENT_ON_DATA:
+      // Si nous recevons des données, les copier dans notre buffer
+      if (evt->data_len > 0) {
+        // Vérifier que nous avons assez d'espace
+        if (player->http_data_received_ + evt->data_len <= player->http_buffer_size_) {
+          memcpy(player->http_buffer_ + player->http_data_received_, evt->data, evt->data_len);
+          player->http_data_received_ += evt->data_len;
+          player->http_data_ready_ = true;
+        } else {
+          ESP_LOGE(TAG, "HTTP buffer overflow, received: %d, new: %d, max: %d", 
+                   player->http_data_received_, evt->data_len, player->http_buffer_size_);
+        }
+      }
+      break;
+    case HTTP_EVENT_ON_FINISH:
+      ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH, data received: %d", player->http_data_received_);
+      player->http_data_ready_ = true;
+      break;
+    case HTTP_EVENT_DISCONNECTED:
+      ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+      break;
+  }
+  
+  return ESP_OK;
+}
+
+bool MoviePlayer::fetch_http_data() {
+  if (this->http_client_ == nullptr) {
+    ESP_LOGE(TAG, "HTTP client not initialized");
+    return false;
+  }
+  
+  // Réinitialiser les indicateurs de données
+  this->http_data_ready_ = false;
+  this->http_data_received_ = 0;
+  
+  // Démarrer la requête HTTP
+  esp_err_t err = esp_http_client_perform(this->http_client_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  
+  // Vérifier le code de statut
+  int status_code = esp_http_client_get_status_code(this->http_client_);
+  if (status_code != 200) {
+    ESP_LOGE(TAG, "HTTP GET request returned status code %d", status_code);
+    return false;
+  }
+  
+  ESP_LOGI(TAG, "HTTP GET request successful, received %d bytes", this->http_data_received_);
+  return (this->http_data_received_ > 0);
+}
+
 void MoviePlayer::decoder_task(void *arg) {
   MoviePlayer *player = static_cast<MoviePlayer *>(arg);
   
@@ -219,7 +379,11 @@ void MoviePlayer::decoder_task(void *arg) {
   if (!player->init_decoder()) {
     ESP_LOGE(TAG, "Failed to initialize decoder");
     player->playing_ = false;
-    player->close_file();
+    if (player->current_source_ == SOURCE_LOCAL_FILE) {
+      player->close_file();
+    } else if (player->current_source_ == SOURCE_HTTP_STREAM) {
+      player->cleanup_http_client();
+    }
     vTaskDelete(nullptr);
     return;
   }
@@ -252,8 +416,9 @@ void MoviePlayer::decoder_task(void *arg) {
     player->current_frame_++;
     
     if (player->current_frame_ % 30 == 0) {
-      ESP_LOGI(TAG, "Frame %d, decode: %ld ms, render: %ld ms", 
-              player->current_frame_, player->decode_time_ms_, player->render_time_ms_);
+      ESP_LOGI(TAG, "Frame %d, decode: %ld ms, render: %ld ms, network: %ld ms", 
+              player->current_frame_, player->decode_time_ms_, player->render_time_ms_, 
+              player->network_time_ms_);
     }
     
     // Calculer le temps d'attente pour maintenir le FPS
@@ -279,13 +444,21 @@ void MoviePlayer::decoder_task(void *arg) {
 }
 
 bool MoviePlayer::init_decoder() {
-  ESP_LOGI(TAG, "Initializing decoder for format: %d", this->current_format_);
+  ESP_LOGI(TAG, "Initializing decoder for format: %d, source: %d", 
+           this->current_format_, this->current_source_);
+  
+  if (this->current_source_ == SOURCE_HTTP_STREAM) {
+    // Initialiser le client HTTP
+    if (!this->init_http_client(this->current_path_)) {
+      return false;
+    }
+  }
   
   switch (this->current_format_) {
     case VIDEO_FORMAT_MJPEG:
       return this->init_mjpeg();
     case VIDEO_FORMAT_MP4:
-      ESP_LOGE(TAG, "MP4 format not yet implemented in ESP-IDF version");
+      ESP_LOGE(TAG, "MP4 format not yet implemented");
       return false;
     default:
       ESP_LOGE(TAG, "Unsupported video format");
@@ -294,23 +467,29 @@ bool MoviePlayer::init_decoder() {
 }
 
 void MoviePlayer::cleanup_decoder() {
-  // Rien de spécifique à nettoyer pour MJPEG pour l'instant
+  if (this->current_source_ == SOURCE_HTTP_STREAM) {
+    this->cleanup_http_client();
+  }
 }
 
 bool MoviePlayer::init_mjpeg() {
-  if (this->video_file_ == nullptr) {
-    ESP_LOGE(TAG, "No file open");
-    return false;
-  }
-  
-  // Vérifier que le fichier commence par un marqueur JPEG
-  uint8_t header[2];
-  size_t read = fread(header, 1, 2, this->video_file_);
-  fseek(this->video_file_, 0, SEEK_SET);
-  
-  if (read != 2 || header[0] != 0xFF || header[1] != 0xD8) {
-    ESP_LOGE(TAG, "File doesn't start with JPEG marker (0xFF 0xD8)");
-    return false;
+  if (this->current_source_ == SOURCE_LOCAL_FILE) {
+    if (this->video_file_ == nullptr) {
+      ESP_LOGE(TAG, "No file open");
+      return false;
+    }
+    
+    // Vérifier que le fichier commence par un marqueur JPEG
+    uint8_t header[2];
+    size_t read = fread(header, 1, 2, this->video_file_);
+    fseek(this->video_file_, 0, SEEK_SET);
+    
+    if (read != 2 || header[0] != 0xFF || header[1] != 0xD8) {
+      ESP_LOGE(TAG, "File doesn't start with JPEG marker (0xFF 0xD8)");
+      return false;
+    }
+  } else if (this->current_source_ == SOURCE_HTTP_STREAM) {
+    // Pour un flux HTTP, nous vérifierons lors de la réception des données
   }
   
   ESP_LOGI(TAG, "MJPEG decoder initialized");
@@ -318,15 +497,58 @@ bool MoviePlayer::init_mjpeg() {
 }
 
 bool MoviePlayer::read_next_frame() {
-  switch (this->current_format_) {
-    case VIDEO_FORMAT_MJPEG:
-      return this->decode_mjpeg_frame();
-    case VIDEO_FORMAT_MP4:
-      // Non implémenté
+  if (this->current_source_ == SOURCE_LOCAL_FILE) {
+    switch (this->current_format_) {
+      case VIDEO_FORMAT_MJPEG:
+        return this->decode_mjpeg_frame();
+      default:
+        return false;
+    }
+  } else if (this->current_source_ == SOURCE_HTTP_STREAM) {
+    // Pour le mode HTTP, nous récupérons d'abord les données
+    int64_t network_start = esp_timer_get_time();
+    
+    if (!this->fetch_http_data()) {
+      ESP_LOGE(TAG, "Failed to fetch HTTP data");
       return false;
-    default:
+    }
+    
+    this->network_time_ms_ = (esp_timer_get_time() - network_start) / 1000;
+    
+    // Configurer les données pour le décodage
+    this->jpg_data_.buf = this->http_buffer_;
+    this->jpg_data_.len = this->http_data_received_;
+    this->jpg_data_.index = 0;
+    
+    // Vérifier l'en-tête JPEG
+    if (this->http_data_received_ < 2 || this->http_buffer_[0] != 0xFF || this->http_buffer_[1] != 0xD8) {
+      ESP_LOGE(TAG, "HTTP data doesn't start with JPEG marker (0xFF 0xD8)");
       return false;
+    }
+    
+    // Réinitialiser les données de frame
+    this->frame_data_.width = 0;
+    this->frame_data_.height = 0;
+    
+    // Décoder le JPEG
+    esp_err_t ret = esp_jpg_decode(
+      this->http_data_received_,
+      JPG_SCALE_NONE,
+      this->jpg_read_callback,
+      this->jpg_decode_callback,
+      &this->jpg_data_,
+      &this->frame_data_
+    );
+    
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "JPEG decode failed: %d", ret);
+      return false;
+    }
+    
+    return true;
   }
+  
+  return false;
 }
 
 size_t MoviePlayer::jpg_read_callback(void *arg, size_t index, uint8_t *buf, size_t len) {
@@ -497,3 +719,4 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
 
 }  // namespace movie
 }  // namespace esphome
+

@@ -8,9 +8,12 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
-#include "driver/i2s.h"
+// Remplacer l'inclusion de i2s déprécié
+#include "driver/i2s_std.h"
 #include "esp_spiffs.h"
-#include "esp_jpg_decode.h"
+// Résoudre l'erreur de esp_jpg_decode.h en utilisant les bibliothèques JPEG disponibles
+#include "esp_jpeg/include/esp_jpg_decode.h" // Certains ESP-IDF
+#include "libjpeg-turbo/include/jpeglib.h"   // Alternative si la première ne fonctionne pas
 #include "esp_http_client.h"
 #include <string>
 
@@ -46,6 +49,10 @@ enum VideoFormat {
   VIDEO_FORMAT_MJPEG,
   VIDEO_FORMAT_MP4,
 };
+
+// Fonction pour décoder un JPEG en RGB565
+// Cette fonction remplace l'utilisation de esp_jpg_decode.h
+bool decode_jpeg(uint8_t *jpeg_data, size_t jpeg_len, uint16_t *rgb565_buffer, int width, int height);
 
 class MoviePlayer : public Component {
  public:
@@ -87,9 +94,8 @@ class MoviePlayer : public Component {
   void cleanup_http_client();
   bool fetch_http_data();
   
-  // Callbacks pour le décodeur JPEG d'ESP-IDF
-  static size_t jpg_read_callback(void *arg, size_t index, uint8_t *buf, size_t len);
-  static bool jpg_decode_callback(void *arg, uint16_t *px_data, int pos_x, int pos_y, int width, int height);
+  // Notre propre implémentation de décodage JPEG
+  bool decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len);
   
   // Callback pour HTTP
   static esp_err_t http_event_handler(esp_http_client_event_t *evt);
@@ -148,10 +154,8 @@ class MoviePlayer : public Component {
   uint32_t decode_time_ms_{0};
   uint32_t render_time_ms_{0};
   uint32_t network_time_ms_{0};
-  
-  // Variable statique pour le callback
-  static MoviePlayer *active_instance_;
 };
 
 }  // namespace movie
 }  // namespace esphome
+

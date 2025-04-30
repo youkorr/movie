@@ -12,7 +12,7 @@
 #include "driver/i2s_std.h"
 #include "esp_spiffs.h"
 
-#include <TJpg_Decoder.h>
+
 
 
 #include "libjpeg-turbo/include/jpeglib.h"   // Alternative si la première ne fonctionne pas

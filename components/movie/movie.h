@@ -8,14 +8,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
-// Remplacer l'inclusion de i2s déprécié
-#include "driver/i2s_std.h"
+#include "driver/i2s_std.h"  // remplacer i2s.h par i2s_std.h
 #include "esp_spiffs.h"
-
-
-
-
-
 #include "esp_http_client.h"
 #include <string>
 
@@ -52,8 +46,7 @@ enum VideoFormat {
   VIDEO_FORMAT_MP4,
 };
 
-// Fonction pour décoder un JPEG en RGB565
-// Cette fonction remplace l'utilisation de esp_jpg_decode.h
+// Prototype de la fonction de décodage JPEG
 bool decode_jpeg(uint8_t *jpeg_data, size_t jpeg_len, uint16_t *rgb565_buffer, int width, int height);
 
 class MoviePlayer : public Component {
@@ -89,15 +82,12 @@ class MoviePlayer : public Component {
   
   // Méthodes spécifiques au format MJPEG
   bool init_mjpeg();
-  bool decode_mjpeg_frame();
+  bool decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len);  // Correction: ajout des paramètres
   
   // Méthodes HTTP
   bool init_http_client(const std::string &url);
   void cleanup_http_client();
   bool fetch_http_data();
-  
-  // Notre propre implémentation de décodage JPEG
-  bool decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len);
   
   // Callback pour HTTP
   static esp_err_t http_event_handler(esp_http_client_event_t *evt);
@@ -160,4 +150,5 @@ class MoviePlayer : public Component {
 
 }  // namespace movie
 }  // namespace esphome
+
 

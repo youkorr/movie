@@ -1,9 +1,11 @@
 #include "movie.h"
 #include "esphome/core/log.h"
-#include "esphome/core/application.h"  // Pour accéder à la liste des écrans
 #include "esp_system.h"
 #include "esp_timer.h"
 #include <string.h>
+
+// Nous avons besoin d'accéder aux constantes de couleur
+using namespace esphome::display;
 
 static const char *TAG = "movie";
 
@@ -73,9 +75,10 @@ MoviePlayer::~MoviePlayer() {
 
 void MoviePlayer::setup() {
   // Trouver l'écran actif dans ESPHome
-  // Correction: utilisation de App->get_displays()
-  for (auto *display : App.get_displays()) {
-    if (display != nullptr) {
+  // Correction: utilisation d'une méthode différente pour trouver l'écran
+  this->display_ = nullptr;
+  for (auto *component : App.get_components()) {
+    if (auto *display = dynamic_cast<display::DisplayBuffer *>(component)) {
       this->display_ = display;
       ESP_LOGI(TAG, "Found display: %dx%d", display->get_width(), display->get_height());
       break;
@@ -527,7 +530,8 @@ bool MoviePlayer::read_next_frame() {
   if (this->current_source_ == SOURCE_LOCAL_FILE) {
     switch (this->current_format_) {
       case VIDEO_FORMAT_MJPEG:
-        return this->decode_mjpeg_frame(this->frame_buffer_, this->buffer_size_);
+        // Correction: appeler la bonne méthode
+        return this->read_mjpeg_frame();
       default:
         return false;
     }
@@ -555,6 +559,43 @@ bool MoviePlayer::read_next_frame() {
   return false;
 }
 
+bool MoviePlayer::read_mjpeg_frame() {
+  if (this->video_file_ == nullptr || this->frame_buffer_ == nullptr) {
+    return false;
+  }
+  
+  // Recherche du marqueur de début JPEG
+  uint8_t marker[2];
+  bool found_start = false;
+  while (!found_start && !feof(this->video_file_)) {
+    size_t read = fread(marker, 1, 2, this->video_file_);
+    if (read != 2) break;
+    
+    if (marker[0] == 0xFF && marker[1] == 0xD8) {
+      // Trouvé un début de JPEG
+      found_start = true;
+      fseek(this->video_file_, -2, SEEK_CUR);  // Revenir au début du marqueur
+    } else {
+      fseek(this->video_file_, -1, SEEK_CUR);  // Reculer d'un octet et réessayer
+    }
+  }
+  
+  if (!found_start) {
+    ESP_LOGI(TAG, "No more JPEG frames found");
+    return false;
+  }
+  
+  // Lire la frame JPEG dans le buffer
+  size_t bytes_read = fread(this->frame_buffer_, 1, this->buffer_size_, this->video_file_);
+  if (bytes_read == 0) {
+    ESP_LOGE(TAG, "Failed to read JPEG data");
+    return false;
+  }
+  
+  // Utiliser notre fonction de décodage
+  return decode_jpeg_frame(this->frame_buffer_, bytes_read);
+}
+
 bool MoviePlayer::decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len) {
   if (!jpeg_data || jpeg_len == 0 || !this->rgb565_buffer_) {
     return false;
@@ -563,8 +604,6 @@ bool MoviePlayer::decode_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len) {
   // Utiliser notre fonction de décodage JPEG
   return decode_jpeg(jpeg_data, jpeg_len, this->rgb565_buffer_, this->width_, this->height_);
 }
-
-// Suppression de la méthode decode_jpeg_frame() sans paramètres qui causait l'erreur
 
 bool MoviePlayer::render_current_frame() {
   if (this->display_ == nullptr || this->rgb565_buffer_ == nullptr) {
@@ -587,21 +626,14 @@ bool MoviePlayer::render_current_frame() {
 }
 
 void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) {
-  // Cette méthode doit être adaptée au type d'affichage utilisé
-  // Exemple pour un DisplayBuffer générique
-  
+  // Cette méthode doit être adaptée au type d'affichage utilisé  
   if (width <= 0 || height <= 0 || buffer == nullptr) {
     ESP_LOGE(TAG, "Invalid frame data");
     return;
   }
   
-  // Dans la plupart des cas, nous devons convertir RGB565 au format de l'écran
-  // et envoyer les données à l'écran
-  
-  // Pour cet exemple, nous allons convertir les pixels RGB565 en pixels binaires pour un affichage monochrome
-  // Si vous utilisez un écran couleur, vous devrez adapter cette méthode
-  
-  this->display_->fill(COLOR_OFF);  // Correction: enlever le préfixe display::
+  // Correction: Utilisation correcte des constantes de couleur
+  this->display_->fill(COLOR_OFF);  // COLOR_OFF est dans le namespace esphome::display
   
   // Calculer les facteurs de mise à l'échelle si nécessaire
   float scale_x = (float)this->display_->get_width() / width;
@@ -621,7 +653,8 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
       uint8_t luminance = (r * 3 + g * 6 + b * 1) / 10;
       
       // Convertir en binaire avec seuil
-      Color color = (luminance > 16) ? COLOR_ON : COLOR_OFF;  // Correction: enlever le préfixe display::
+      // Correction: utilisation correcte des constantes de couleur
+      display::Color color = (luminance > 16) ? COLOR_ON : COLOR_OFF;
       
       // Position sur l'écran (avec mise à l'échelle si nécessaire)
       int display_x = x * scale_x;
@@ -638,5 +671,6 @@ void MoviePlayer::display_rgb565_frame(uint16_t *buffer, int width, int height) 
 
 }  // namespace movie
 }  // namespace esphome
+
 
 

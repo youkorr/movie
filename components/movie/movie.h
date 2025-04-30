@@ -15,7 +15,7 @@
 
 
 
-#include "libjpeg-turbo/include/jpeglib.h"   // Alternative si la première ne fonctionne pas
+
 #include "esp_http_client.h"
 #include <string>
 

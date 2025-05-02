@@ -1,76 +1,121 @@
-#pragma once
+import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.const import CONF_ID, CONF_URL, CONF_FORMAT, CONF_WIDTH, CONF_HEIGHT, CONF_FPS
+from esphome.components import display
+from esphome import automation
 
-#include "esphome/core/component.h"
-#include "esphome/core/automation.h"
-#include "movie.h"
+DEPENDENCIES = ["esp32"]
+CODEOWNERS = ["@votre_nom_utilisateur"]
 
-namespace esphome {
-namespace movie {
+movie_ns = cg.esphome_ns.namespace("movie")
+MoviePlayer = movie_ns.class_("MoviePlayer", cg.Component)
 
-class PlayFileAction : public Action<> {
- public:
-  explicit PlayFileAction(MoviePlayer *player) : player_(player) {}
+VideoFormat = movie_ns.enum("VideoFormat")
+VIDEO_FORMATS = {
+    "MJPEG": movie_ns.VIDEO_FORMAT_MJPEG,
+    "AVI": movie_ns.VIDEO_FORMAT_AVI,
+}
 
-  void set_file_path(const std::string &file_path) { this->file_path_ = file_path; }
-  void set_format(VideoFormat format) { this->format_ = format; }
+PlayFileAction = movie_ns.class_("PlayFileAction", automation.Action)
+PlayHttpStreamAction = movie_ns.class_("PlayHttpStreamAction", automation.Action)
+StopAction = movie_ns.class_("StopAction", automation.Action)
 
-  void play(bool wait_for_completion = false) {
-    this->player_->play_file(this->file_path_, this->format_);
-    // Option pour attendre la fin de la lecture si nécessaire
-    if (wait_for_completion) {
-      // Implémentez la logique d'attente si nécessaire
-    }
-  }
+# Configuration constants
+CONF_MOVIE_ID = "movie_id"
+CONF_DISPLAY = "display"
+CONF_BUFFER_SIZE = "buffer_size"
+CONF_FILE_PATH = "file_path"
+CONF_HTTP_TIMEOUT = "http_timeout"
+CONF_WAIT_FOR_COMPLETION = "wait_for_completion"
 
-  void set_player(MoviePlayer *player) { this->player_ = player; }
+CONFIG_SCHEMA = cv.Schema({
+    cv.GenerateID(): cv.declare_id(MoviePlayer),
+    cv.Required(CONF_DISPLAY): cv.use_id(display.DisplayBuffer),
+    cv.Required(CONF_WIDTH): cv.positive_int,
+    cv.Required(CONF_HEIGHT): cv.positive_int,
+    cv.Optional(CONF_BUFFER_SIZE, default=8192): cv.positive_int,
+    cv.Optional(CONF_FPS, default=10): cv.positive_int,
+    cv.Optional(CONF_HTTP_TIMEOUT, default=5000): cv.positive_int,
+    cv.Optional(CONF_FORMAT, default="MJPEG"): cv.enum(VIDEO_FORMATS, upper=True),
+}).extend(cv.COMPONENT_SCHEMA)
 
-  void play() override { this->play(false); }
+def to_code(config):
+    var = cg.new_Pvariable(config[CONF_ID])
+    yield cg.register_component(var, config)
+    
+    disp = yield cg.get_variable(config[CONF_DISPLAY])
+    cg.add(var.set_display(disp))
+    
+    cg.add(var.set_width(config[CONF_WIDTH]))
+    cg.add(var.set_height(config[CONF_HEIGHT]))
+    cg.add(var.set_buffer_size(config[CONF_BUFFER_SIZE]))
+    cg.add(var.set_fps(config[CONF_FPS]))
+    cg.add(var.set_http_timeout(config[CONF_HTTP_TIMEOUT]))
+    
+    if CONF_FORMAT in config:
+        format_val = config[CONF_FORMAT]
+        cg.add(var.set_format(VIDEO_FORMATS[format_val]))
 
- protected:
-  MoviePlayer *player_;
-  std::string file_path_;
-  VideoFormat format_{FORMAT_MJPEG};
-};
+# Actions
+@automation.register_action(
+    "movie.play_file",
+    PlayFileAction,
+    cv.Schema({
+        cv.GenerateID(): cv.use_id(MoviePlayer),
+        cv.Required(CONF_FILE_PATH): cv.string,
+        cv.Optional(CONF_FORMAT, default="MJPEG"): cv.enum(VIDEO_FORMATS, upper=True),
+        cv.Optional(CONF_WAIT_FOR_COMPLETION, default=False): cv.boolean,
+    })
+)
+def play_file_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    yield cg.register_parented(var, config[CONF_ID])
+    
+    cg.add(var.set_file_path(config[CONF_FILE_PATH]))
+    cg.add(var.set_format(VIDEO_FORMATS[config[CONF_FORMAT]]))
+    
+    # Implémentez la logique d'attente si nécessaire
+    wait = config[CONF_WAIT_FOR_COMPLETION]
+    if wait:
+        cg.add(var.play(True))
+    
+    return var
 
-class PlayHttpStreamAction : public Action<> {
- public:
-  explicit PlayHttpStreamAction(MoviePlayer *player) : player_(player) {}
+@automation.register_action(
+    "movie.play_http_stream",
+    PlayHttpStreamAction,
+    cv.Schema({
+        cv.GenerateID(): cv.use_id(MoviePlayer),
+        cv.Required(CONF_URL): cv.string,
+        cv.Optional(CONF_FORMAT, default="MJPEG"): cv.enum(VIDEO_FORMATS, upper=True),
+        cv.Optional(CONF_WAIT_FOR_COMPLETION, default=False): cv.boolean,
+    })
+)
+def play_http_stream_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    yield cg.register_parented(var, config[CONF_ID])
+    
+    cg.add(var.set_url(config[CONF_URL]))
+    cg.add(var.set_format(VIDEO_FORMATS[config[CONF_FORMAT]]))
+    
+    # Implémentez la logique d'attente si nécessaire
+    wait = config[CONF_WAIT_FOR_COMPLETION]
+    if wait:
+        cg.add(var.play(True))
+    
+    return var
 
-  void set_url(const std::string &url) { this->url_ = url; }
-  void set_format(VideoFormat format) { this->format_ = format; }
-
-  void play(bool wait_for_completion = false) {
-    this->player_->play_http_stream(this->url_, this->format_);
-    // Option pour attendre la fin de la lecture si nécessaire
-    if (wait_for_completion) {
-      // Implémentez la logique d'attente si nécessaire
-    }
-  }
-
-  void set_player(MoviePlayer *player) { this->player_ = player; }
-
-  void play() override { this->play(false); }
-
- protected:
-  MoviePlayer *player_;
-  std::string url_;
-  VideoFormat format_{FORMAT_MJPEG};
-};
-
-class StopAction : public Action<> {
- public:
-  explicit StopAction(MoviePlayer *player) : player_(player) {}
-
-  void set_player(MoviePlayer *player) { this->player_ = player; }
-
-  void play() override { this->player_->stop(); }
-
- protected:
-  MoviePlayer *player_;
-};
-
-}  // namespace movie
-}  // namespace esphome
+@automation.register_action(
+    "movie.stop",
+    StopAction,
+    cv.Schema({
+        cv.GenerateID(): cv.use_id(MoviePlayer),
+    })
+)
+def stop_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    yield cg.register_parented(var, config[CONF_ID])
+    return var
 
 
 

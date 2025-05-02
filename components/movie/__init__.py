@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_URL, CONF_FORMAT, CONF_WIDTH, CONF_HEIGHT, CONF_FPS
+from esphome.const import CONF_ID, CONF_URL, CONF_WIDTH, CONF_HEIGHT
 from esphome.components import display
 from esphome import automation
 
@@ -9,6 +9,15 @@ CODEOWNERS = ["@votre_nom_utilisateur"]
 
 movie_ns = cg.esphome_ns.namespace("movie")
 MoviePlayer = movie_ns.class_("MoviePlayer", cg.Component)
+
+# Définir localement les constantes manquantes
+CONF_DISPLAY = "display"
+CONF_FORMAT = "format"
+CONF_FPS = "fps"
+CONF_BUFFER_SIZE = "buffer_size"
+CONF_HTTP_TIMEOUT = "http_timeout"
+CONF_FILE_PATH = "file_path"
+CONF_WAIT_FOR_COMPLETION = "wait_for_completion"
 
 VideoFormat = movie_ns.enum("VideoFormat")
 VIDEO_FORMATS = {
@@ -19,14 +28,6 @@ VIDEO_FORMATS = {
 PlayFileAction = movie_ns.class_("PlayFileAction", automation.Action)
 PlayHttpStreamAction = movie_ns.class_("PlayHttpStreamAction", automation.Action)
 StopAction = movie_ns.class_("StopAction", automation.Action)
-
-# Configuration constants
-CONF_MOVIE_ID = "movie_id"
-CONF_DISPLAY = "display"
-CONF_BUFFER_SIZE = "buffer_size"
-CONF_FILE_PATH = "file_path"
-CONF_HTTP_TIMEOUT = "http_timeout"
-CONF_WAIT_FOR_COMPLETION = "wait_for_completion"
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(MoviePlayer),

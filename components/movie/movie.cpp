@@ -1,5 +1,6 @@
 #include "movie.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"  // Ajouté pour millis()
 #include "esp_system.h"
 
 static const char *TAG = "movie";
@@ -21,16 +22,11 @@ MoviePlayer::~MoviePlayer() {
 }
 
 void MoviePlayer::setup() {
-  // Trouver l'écran actif dans ESPHome
-  for (auto *display : display::DisplayBuffer::displays) {
-    if (display != nullptr) {
-      this->display_ = display;
-      ESP_LOGI(TAG, "Found display: %dx%d", display->get_width(), display->get_height());
-      break;
-    }
-  }
-
-  if (this->display_ == nullptr) {
+  // Problème: displays n'est pas un membre de DisplayBuffer
+  // Solution: Nous utiliserons l'affichage qui a été défini via set_display()
+  if (this->display_ != nullptr) {
+    ESP_LOGI(TAG, "Using provided display: %dx%d", this->display_->get_width(), this->display_->get_height());
+  } else {
     ESP_LOGE(TAG, "No display found!");
     this->mark_failed();
     return;
@@ -47,7 +43,8 @@ void MoviePlayer::setup() {
 void MoviePlayer::loop() {
   // Vérifier les FPS pour les logs
   if (this->playing_ && this->frames_displayed_ > 0) {
-    uint32_t current_time = millis();
+    // Correction: millis() -> esphome::millis()
+    uint32_t current_time = esphome::millis();
     uint32_t elapsed = current_time - this->last_frame_time_;
     
     if (elapsed > 1000) {  // Toutes les secondes
@@ -96,7 +93,8 @@ bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
   
   // Réinitialiser les compteurs
   this->frames_displayed_ = 0;
-  this->last_frame_time_ = millis();
+  // Correction: millis() -> esphome::millis()
+  this->last_frame_time_ = esphome::millis();
   this->playing_ = true;
   
   // Démarrer la lecture
@@ -137,7 +135,8 @@ bool MoviePlayer::play_http_stream(const std::string &url, VideoFormat format) {
   
   // Réinitialiser les compteurs
   this->frames_displayed_ = 0;
-  this->last_frame_time_ = millis();
+  // Correction: millis() -> esphome::millis()
+  this->last_frame_time_ = esphome::millis();
   this->playing_ = true;
   
   // Démarrer la lecture
@@ -195,7 +194,7 @@ bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
   const uint16_t *rgb_data = reinterpret_cast<const uint16_t *>(data);
   
   // Effacer l'écran
-  this->display_->fill(display::COLOR_OFF);
+  this->display_->fill(esphome::COLOR_OFF);  // Changé pour utiliser le namespace correct
   
   // Calculer les facteurs de mise à l'échelle
   float scale_x = (float)this->display_->get_width() / width;
@@ -215,7 +214,9 @@ bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
       uint8_t luminance = (r * 3 + g * 6 + b) / 10;
       
       // Convertir en binaire avec seuil pour les écrans monochromes
-      display::Color color = (luminance > 16) ? display::COLOR_ON : display::COLOR_OFF;
+      // Correction: display::Color -> esphome::Color
+      // Correction: display::COLOR_ON -> esphome::COLOR_ON
+      esphome::Color color = (luminance > 16) ? esphome::COLOR_ON : esphome::COLOR_OFF;
       
       // Position sur l'écran (avec mise à l'échelle)
       int display_x = x * scale_x;

@@ -1,34 +1,76 @@
-import esphome.codegen as cg
-import esphome.config_validation as cv
-from esphome.components import display
-from esphome.const import CONF_ID
+#pragma once
 
-DEPENDENCIES = ['display']
-MULTI_CONF = True
+#include "esphome/core/component.h"
+#include "esphome/core/automation.h"
+#include "movie.h"
 
-movie_ns = cg.esphome_ns.namespace('movie')
-MoviePlayer = movie_ns.class_('MoviePlayer', cg.Component)
+namespace esphome {
+namespace movie {
 
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(MoviePlayer),
-    cv.Optional('display_width', default=320): cv.int_,
-    cv.Optional('display_height', default=240): cv.int_,
-    cv.Optional('buffer_size', default=8192): cv.int_,
-    cv.Optional('fps', default=15): cv.int_,
-    cv.Optional('http_timeout', default=5000): cv.int_,
-    cv.Optional('http_buffer_size', default=4096): cv.int_,
-}).extend(cv.COMPONENT_SCHEMA)
+class PlayFileAction : public Action<> {
+ public:
+  explicit PlayFileAction(MoviePlayer *player) : player_(player) {}
 
-async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
-    await cg.register_component(var, config)
-    
-    cg.add(var.set_display_width(config['display_width']))
-    cg.add(var.set_display_height(config['display_height']))
-    cg.add(var.set_buffer_size(config['buffer_size']))
-    cg.add(var.set_fps(config['fps']))
-    cg.add(var.set_http_timeout(config['http_timeout']))
-    cg.add(var.set_http_buffer_size(config['http_buffer_size']))
+  void set_file_path(const std::string &file_path) { this->file_path_ = file_path; }
+  void set_format(VideoFormat format) { this->format_ = format; }
+
+  void play(bool wait_for_completion = false) {
+    this->player_->play_file(this->file_path_, this->format_);
+    // Option pour attendre la fin de la lecture si nécessaire
+    if (wait_for_completion) {
+      // Implémentez la logique d'attente si nécessaire
+    }
+  }
+
+  void set_player(MoviePlayer *player) { this->player_ = player; }
+
+  void play() override { this->play(false); }
+
+ protected:
+  MoviePlayer *player_;
+  std::string file_path_;
+  VideoFormat format_{FORMAT_MJPEG};
+};
+
+class PlayHttpStreamAction : public Action<> {
+ public:
+  explicit PlayHttpStreamAction(MoviePlayer *player) : player_(player) {}
+
+  void set_url(const std::string &url) { this->url_ = url; }
+  void set_format(VideoFormat format) { this->format_ = format; }
+
+  void play(bool wait_for_completion = false) {
+    this->player_->play_http_stream(this->url_, this->format_);
+    // Option pour attendre la fin de la lecture si nécessaire
+    if (wait_for_completion) {
+      // Implémentez la logique d'attente si nécessaire
+    }
+  }
+
+  void set_player(MoviePlayer *player) { this->player_ = player; }
+
+  void play() override { this->play(false); }
+
+ protected:
+  MoviePlayer *player_;
+  std::string url_;
+  VideoFormat format_{FORMAT_MJPEG};
+};
+
+class StopAction : public Action<> {
+ public:
+  explicit StopAction(MoviePlayer *player) : player_(player) {}
+
+  void set_player(MoviePlayer *player) { this->player_ = player; }
+
+  void play() override { this->player_->stop(); }
+
+ protected:
+  MoviePlayer *player_;
+};
+
+}  // namespace movie
+}  // namespace esphome
 
 
 

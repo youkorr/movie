@@ -12,7 +12,7 @@
 
 static const char *TAG = "esp32_ffmpeg";
 
-// Structure légère pour imiter un contexte FFmpeg minimal
+// Structure du contexte
 struct esp_ffmpeg_context_s {
     char *source_url;
     esp_ffmpeg_source_type_t source_type;
@@ -32,21 +32,20 @@ struct esp_ffmpeg_context_s {
     uint8_t *buffer;
     size_t buffer_size;
 
-    // Info sur la vidéo
+    // Info vidéo
     int width;
     int height;
     int frame_count;
-    bool is_mjpeg;    // Format MJPEG (le seul vraiment supporté pour l'instant)
+    bool is_mjpeg;
 };
 
-// Fonction de décodage JPEG simplifiée (à remplacer par un vrai décodeur pour la prod)
+// Décodage JPEG fictif (remplacer par tjpgd si besoin)
 static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
                         uint16_t *rgb565_buffer, int width, int height) {
     if (data_len < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
         ESP_LOGE(TAG, "Not a valid JPEG marker");
         return false;
     }
-    // Décodage factice pour exemple
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int offset = ((y * width + x) * 3) % (data_len - 10);
@@ -63,13 +62,11 @@ static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
     return true;
 }
 
-// Fonction pour lire les données MJPEG
+// Lecture d'une frame MJPEG
 static bool read_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
                              size_t buffer_size, size_t *bytes_read) {
     if (ctx->source_type == ESP_FFMPEG_SOURCE_TYPE_FILE) {
-        if (ctx->input_file == NULL) {
-            return false;
-        }
+        if (ctx->input_file == NULL) return false;
         uint8_t marker[2];
         bool found_start = false;
         while (!found_start && !feof(ctx->input_file)) {
@@ -82,9 +79,7 @@ static bool read_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
                 fseek(ctx->input_file, -1, SEEK_CUR);
             }
         }
-        if (!found_start) {
-            return false;
-        }
+        if (!found_start) return false;
         *bytes_read = fread(buffer, 1, buffer_size, ctx->input_file);
         return (*bytes_read > 0);
     }
@@ -125,7 +120,7 @@ static void ffmpeg_decode_task(void *arg) {
     }
     ESP_LOGI(TAG, "Decoder task started");
 
-    // Allouer mémoire pour la frame RGB565 (en PSRAM si dispo)
+    // Allouer la frame RGB565 (PSRAM si dispo)
     size_t rgb565_size = ctx->width * ctx->height * sizeof(uint16_t);
     uint16_t *rgb565_buffer = NULL;
 #if CONFIG_SPIRAM
@@ -148,8 +143,7 @@ static void ffmpeg_decode_task(void *arg) {
         .pts = 0
     };
 
-    // Calcul du délai pour le FPS (par défaut 10 FPS)
-    const TickType_t delay_time = pdMS_TO_TICKS(100);
+    const TickType_t delay_time = pdMS_TO_TICKS(100); // 10 FPS
 
     while (ctx->running) {
         size_t bytes_read = 0;
@@ -176,19 +170,16 @@ static void ffmpeg_decode_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// Initialisation
 esp_err_t esp_ffmpeg_init(const char *source_url,
                          esp_ffmpeg_source_type_t source_type,
                          esp_ffmpeg_frame_callback_t frame_callback,
                          void *user_data,
                          esp_ffmpeg_context_t **ctx) {
-    if (!source_url || !ctx) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (!source_url || !ctx) return ESP_ERR_INVALID_ARG;
 
     esp_ffmpeg_context_t *new_ctx = calloc(1, sizeof(esp_ffmpeg_context_t));
-    if (!new_ctx) {
-        return ESP_ERR_NO_MEM;
-    }
+    if (!new_ctx) return ESP_ERR_NO_MEM;
 
     new_ctx->source_url = strdup(source_url);
     new_ctx->source_type = source_type;
@@ -196,14 +187,13 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
     new_ctx->user_data = user_data;
     new_ctx->running = false;
     new_ctx->mutex = xSemaphoreCreateMutex();
-    // Valeurs par défaut sûres pour petits écrans
-    new_ctx->width = 128;
+    new_ctx->width = 128;   // Valeurs par défaut adaptées à ton écran
     new_ctx->height = 64;
     new_ctx->frame_count = 0;
     new_ctx->is_mjpeg = true;
 
-    // Buffer de décodage (en PSRAM si dispo)
-    new_ctx->buffer_size = 16384; // 16 Ko (suffisant pour du 128x64 MJPEG)
+    // Buffer de décodage (PSRAM si dispo)
+    new_ctx->buffer_size = 16384; // 16 Ko (suffisant pour 128x64 MJPEG)
 #if CONFIG_SPIRAM
     new_ctx->buffer = heap_caps_malloc(new_ctx->buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
@@ -248,18 +238,13 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
 }
 
 esp_err_t esp_ffmpeg_start(esp_ffmpeg_context_t *ctx) {
-    if (!ctx) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (ctx->running) {
-        return ESP_OK;
-    }
+    if (!ctx) return ESP_ERR_INVALID_ARG;
+    if (ctx->running) return ESP_OK;
     ctx->running = true;
-    // Tâche avec stack réduite (2048)
     BaseType_t ret = xTaskCreate(
         ffmpeg_decode_task,
         "ffmpeg_decode",
-        2048,
+        2048, // Stack réduite
         ctx,
         tskIDLE_PRIORITY + 1,
         &ctx->task_handle
@@ -273,12 +258,8 @@ esp_err_t esp_ffmpeg_start(esp_ffmpeg_context_t *ctx) {
 }
 
 esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx) {
-    if (!ctx) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!ctx->running) {
-        return ESP_OK;
-    }
+    if (!ctx) return ESP_ERR_INVALID_ARG;
+    if (!ctx->running) return ESP_OK;
     ctx->running = false;
     vTaskDelay(pdMS_TO_TICKS(100));
     if (ctx->source_type == ESP_FFMPEG_SOURCE_TYPE_FILE && ctx->input_file) {
@@ -297,9 +278,7 @@ esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx) {
 }
 
 esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int height, int dst_format) {
-    if (!src || !dst) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (!src || !dst) return ESP_ERR_INVALID_ARG;
     switch (dst_format) {
         case 0:  // RGB565 -> RGB565 (copie)
             memcpy(dst, src, width * height * sizeof(uint16_t));

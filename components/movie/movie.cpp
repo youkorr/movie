@@ -27,6 +27,10 @@ MoviePlayer::~MoviePlayer() {
 void MoviePlayer::setup() {
   if (this->display_ != nullptr) {
     ESP_LOGI(TAG, "Using provided display: %dx%d", this->display_->get_width(), this->display_->get_height());
+    
+    // Mettre à jour les dimensions en fonction de l'écran réel
+    this->width_ = this->display_->get_width();
+    this->height_ = this->display_->get_height();
   } else {
     ESP_LOGE(TAG, "No display found!");
     this->mark_failed();
@@ -70,7 +74,21 @@ bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
     this->stop();
   }
 
-  ESP_LOGI(TAG, "Starting playback of local file: '%s'", file_path.c_str());
+  // Détection du format basée sur l'extension
+  if (format == VIDEO_FORMAT_AUTO) {
+    if (file_path.find(".avi") != std::string::npos) {
+      format = VIDEO_FORMAT_AVI;
+      ESP_LOGI(TAG, "Auto-detected AVI format");
+    } else if (file_path.find(".mp4") != std::string::npos) {
+      format = VIDEO_FORMAT_MP4;
+      ESP_LOGI(TAG, "Auto-detected MP4 format (limited support)");
+    } else {
+      format = VIDEO_FORMAT_MJPEG;
+      ESP_LOGI(TAG, "Default to MJPEG format");
+    }
+  }
+
+  ESP_LOGI(TAG, "Starting playback of local file: '%s' (format: %d)", file_path.c_str(), format);
   this->current_path_ = file_path;
   this->current_format_ = format;
   this->current_source_type_ = ESP_FFMPEG_SOURCE_TYPE_FILE;
@@ -108,21 +126,49 @@ bool MoviePlayer::play_http_stream(const std::string &url, VideoFormat format) {
     this->stop();
   }
 
-  ESP_LOGI(TAG, "Starting playback from HTTP stream: '%s'", url.c_str());
+  // Détection du format basée sur l'URL
+  if (format == VIDEO_FORMAT_AUTO) {
+    if (url.find(".avi") != std::string::npos) {
+      format = VIDEO_FORMAT_AVI;
+      ESP_LOGI(TAG, "Auto-detected AVI format from URL");
+    } else if (url.find(".mp4") != std::string::npos) {
+      format = VIDEO_FORMAT_MP4;
+      ESP_LOGI(TAG, "Auto-detected MP4 format from URL (limited support)");
+    } else {
+      format = VIDEO_FORMAT_MJPEG;
+      ESP_LOGI(TAG, "Default to MJPEG format for HTTP stream");
+    }
+  }
+
+  ESP_LOGI(TAG, "Starting playback from HTTP stream: '%s' (format: %d)", url.c_str(), format);
   this->current_path_ = url;
   this->current_format_ = format;
   this->current_source_type_ = ESP_FFMPEG_SOURCE_TYPE_HTTP;
   
-  esp_err_t ret = esp_ffmpeg_init(
-    url.c_str(),
-    ESP_FFMPEG_SOURCE_TYPE_HTTP,
-    MoviePlayer::ffmpeg_frame_callback,
-    this,
-    &this->ffmpeg_ctx_
-  );
+  // Ajouter des tentatives de connexion pour les URLs HTTP
+  int retry_count = 0;
+  const int max_retries = 3;
+  esp_err_t ret = ESP_FAIL;
+  
+  while (retry_count < max_retries) {
+    ret = esp_ffmpeg_init(
+      url.c_str(),
+      ESP_FFMPEG_SOURCE_TYPE_HTTP,
+      MoviePlayer::ffmpeg_frame_callback,
+      this,
+      &this->ffmpeg_ctx_
+    );
+    
+    if (ret == ESP_OK) break;
+    
+    ESP_LOGW(TAG, "Failed to initialize FFmpeg, retrying (%d/%d): %s", 
+             retry_count + 1, max_retries, esp_err_to_name(ret));
+    retry_count++;
+    delay(500);  // Petit délai entre les tentatives
+  }
   
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to initialize FFmpeg: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Failed to initialize FFmpeg after %d attempts: %s", max_retries, esp_err_to_name(ret));
     return false;
   }
   
@@ -175,23 +221,63 @@ bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
   
   this->display_->fill(COLOR_OFF);  // corrigé
   
-  float scale_x = (float)this->display_->get_width() / width;
-  float scale_y = (float)this->display_->get_height() / height;
+  // Calculer les facteurs d'échelle et la position pour centrer l'image
+  float scale_x = 1.0, scale_y = 1.0;
+  int pos_x = 0, pos_y = 0;
   
-  for (int y = 0; y < height && y < this->display_->get_height(); y++) {
-    for (int x = 0; x < width && x < this->display_->get_width(); x++) {
+  // Option 1: Remplir l'écran (déformation possible)
+  if (this->scaling_mode_ == SCALE_FILL) {
+    scale_x = (float)this->display_->get_width() / width;
+    scale_y = (float)this->display_->get_height() / height;
+  } 
+  // Option 2: Ajuster proportionnellement (préserver le ratio)
+  else if (this->scaling_mode_ == SCALE_FIT) {
+    float scale = std::min((float)this->display_->get_width() / width, 
+                          (float)this->display_->get_height() / height);
+    scale_x = scale_y = scale;
+    
+    // Centrer l'image
+    pos_x = (this->display_->get_width() - width * scale_x) / 2;
+    pos_y = (this->display_->get_height() - height * scale_y) / 2;
+  }
+  // Option 3: Pas de mise à l'échelle (1:1)
+  else {
+    // Centrer l'image
+    pos_x = (this->display_->get_width() - width) / 2;
+    pos_y = (this->display_->get_height() - height) / 2;
+    
+    // Limiter aux valeurs positives
+    pos_x = std::max(0, pos_x);
+    pos_y = std::max(0, pos_y);
+  }
+  
+  // Optimisation pour certains types d'écrans monochromes
+  int threshold = this->threshold_;  // Valeur de seuil (0-255)
+  
+  for (int y = 0; y < height; y++) {
+    int target_y = pos_y + y * scale_y;
+    if (target_y < 0 || target_y >= this->display_->get_height()) 
+      continue;
+      
+    for (int x = 0; x < width; x++) {
+      int target_x = pos_x + x * scale_x;
+      if (target_x < 0 || target_x >= this->display_->get_width()) 
+        continue;
+      
       uint16_t pixel = rgb_data[y * width + x];
-      uint8_t r = (pixel >> 11) & 0x1F;
-      uint8_t g = (pixel >> 5) & 0x3F;
-      uint8_t b = pixel & 0x1F;
+      
+      // Extraction des composantes RGB
+      uint8_t r = ((pixel >> 11) & 0x1F) << 3;  // Convertir 5 bits en 8 bits
+      uint8_t g = ((pixel >> 5) & 0x3F) << 2;   // Convertir 6 bits en 8 bits
+      uint8_t b = (pixel & 0x1F) << 3;          // Convertir 5 bits en 8 bits
+      
+      // Calcul de la luminance (formule standard)
       uint8_t luminance = (r * 3 + g * 6 + b) / 10;
-
-      esphome::Color color = (luminance > 16) ? COLOR_ON : COLOR_OFF;  // corrigé
       
-      int display_x = x * scale_x;
-      int display_y = y * scale_y;
+      // Appliquer un seuil pour avoir des pixels noir/blanc
+      esphome::Color color = (luminance > threshold) ? COLOR_ON : COLOR_OFF;
       
-      this->display_->draw_pixel_at(display_x, display_y, color);
+      this->display_->draw_pixel_at(target_x, target_y, color);
     }
   }
   
@@ -201,8 +287,19 @@ bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
   return true;
 }
 
+// Défini un seuil personnalisé pour la conversion monochrome (0-255)
+void MoviePlayer::set_threshold(uint8_t threshold) {
+  this->threshold_ = threshold;
+}
+
+// Défini le mode de mise à l'échelle de la vidéo
+void MoviePlayer::set_scaling_mode(ScalingMode mode) {
+  this->scaling_mode_ = mode;
+}
+
 }  // namespace movie
 }  // namespace esphome
+
 
 
 

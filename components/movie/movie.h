@@ -57,12 +57,12 @@ protected:
 
     // Affichage
     display::DisplayBuffer *display_{nullptr};
-    int width_{320};
-    int height_{240};
+    int width_{160};
+    int height_{120};
 
     // Configuration
-    size_t buffer_size_{32 * 1024};
-    int fps_{30};
+    size_t buffer_size_{16 * 1024};
+    int fps_{15};
     int http_timeout_ms_{5000};
 
     // État de lecture

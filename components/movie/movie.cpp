@@ -73,7 +73,9 @@ bool MoviePlayer::play_file(const std::string &file_path, VideoFormat format) {
     ESP_LOGW(TAG, "Already playing a video, stopping current playback");
     this->stop();
   }
-
+  if (format == VIDEO_FORMAT_AUTO && this->default_format_ != VIDEO_FORMAT_AUTO) {
+  format = this->default_format_;
+  }
   // Détection du format basée sur l'extension
   if (format == VIDEO_FORMAT_AUTO) {
     if (file_path.find(".avi") != std::string::npos) {
@@ -125,7 +127,9 @@ bool MoviePlayer::play_http_stream(const std::string &url, VideoFormat format) {
     ESP_LOGW(TAG, "Already playing a video, stopping current playback");
     this->stop();
   }
-
+  if (format == VIDEO_FORMAT_AUTO && this->default_format_ != VIDEO_FORMAT_AUTO) {
+  format = this->default_format_;
+  }
   // Détection du format basée sur l'URL
   if (format == VIDEO_FORMAT_AUTO) {
     if (url.find(".avi") != std::string::npos) {

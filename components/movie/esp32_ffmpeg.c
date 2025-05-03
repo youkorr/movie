@@ -12,6 +12,26 @@
 
 static const char *TAG = "esp32_ffmpeg";
 
+// Structures pour le format AVI
+typedef struct {
+    char id[4];
+    uint32_t size;
+} riff_chunk_t;
+
+typedef struct {
+    uint32_t chunk_size;
+    uint16_t width;
+    uint16_t height;
+    uint16_t planes;
+    uint16_t bit_count;
+    uint32_t compression;
+    uint32_t image_size;
+    uint32_t x_pels_per_meter;
+    uint32_t y_pels_per_meter;
+    uint32_t clr_used;
+    uint32_t clr_important;
+} avi_bitmap_info_header_t;
+
 // Structure du contexte
 struct esp_ffmpeg_context_s {
     char *source_url;
@@ -37,6 +57,13 @@ struct esp_ffmpeg_context_s {
     int height;
     int frame_count;
     bool is_mjpeg;
+    
+    // Pour AVI
+    bool is_avi;
+    long avi_data_offset;     // Offset où commencent les données vidéo
+    long avi_current_offset;  // Offset courant de lecture
+    uint32_t avi_frame_size;  // Taille moyenne des frames
+    uint32_t avi_total_frames; // Nombre total de frames
 };
 
 // Décodage JPEG fictif (remplacer par tjpgd si besoin)
@@ -86,11 +113,278 @@ static int find_jpeg_marker(uint8_t *buffer, size_t buffer_size) {
     return -1;
 }
 
+// Parser l'en-tête AVI
+static bool parse_avi_header(esp_ffmpeg_context_t *ctx) {
+    if (!ctx || !ctx->input_file) return false;
+    
+    // Revenir au début du fichier
+    fseek(ctx->input_file, 0, SEEK_SET);
+    
+    // Lire le header RIFF
+    riff_chunk_t riff_header;
+    if (fread(&riff_header, sizeof(riff_chunk_t), 1, ctx->input_file) != 1) {
+        ESP_LOGE(TAG, "Failed to read RIFF header");
+        return false;
+    }
+    
+    // Vérifier que c'est bien un RIFF
+    if (strncmp(riff_header.id, "RIFF", 4) != 0) {
+        ESP_LOGE(TAG, "Not a RIFF file");
+        return false;
+    }
+    
+    // Lire l'identifiant AVI
+    char avi_id[4];
+    if (fread(avi_id, 4, 1, ctx->input_file) != 1 || strncmp(avi_id, "AVI ", 4) != 0) {
+        ESP_LOGE(TAG, "Not an AVI file");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Valid AVI file detected");
+    ctx->is_avi = true;
+    
+    // Parcourir les chunks pour trouver les informations nécessaires
+    bool found_header = false;
+    bool found_movi = false;
+    char chunk_id[4];
+    uint32_t chunk_size;
+    uint32_t frames_count = 0;
+    uint32_t stream_format = 0;
+    
+    while (!feof(ctx->input_file) && !(found_header && found_movi)) {
+        // Lire l'identifiant du chunk
+        if (fread(chunk_id, 4, 1, ctx->input_file) != 1) break;
+        
+        // Lire la taille du chunk
+        if (fread(&chunk_size, 4, 1, ctx->input_file) != 1) break;
+        
+        ESP_LOGD(TAG, "Chunk: %.4s, Size: %d", chunk_id, chunk_size);
+        
+        // Recherche des chunks importants
+        if (strncmp(chunk_id, "LIST", 4) == 0) {
+            char list_type[4];
+            if (fread(list_type, 4, 1, ctx->input_file) != 1) break;
+            
+            ESP_LOGD(TAG, "List type: %.4s", list_type);
+            
+            if (strncmp(list_type, "hdrl", 4) == 0) {
+                // Traiter l'en-tête pour obtenir la résolution
+                char subchunk_id[4];
+                uint32_t subchunk_size;
+                
+                while (!feof(ctx->input_file) && !found_header) {
+                    if (fread(subchunk_id, 4, 1, ctx->input_file) != 1) break;
+                    if (fread(&subchunk_size, 4, 1, ctx->input_file) != 1) break;
+                    
+                    ESP_LOGD(TAG, "Subchunk: %.4s, Size: %d", subchunk_id, subchunk_size);
+                    
+                    if (strncmp(subchunk_id, "avih", 4) == 0) {
+                        // MainAVIHeader
+                        uint32_t micro_sec_per_frame;
+                        if (fread(&micro_sec_per_frame, 4, 1, ctx->input_file) != 1) break;
+                        
+                        // Ignorer les 8 octets suivants
+                        fseek(ctx->input_file, 8, SEEK_CUR);
+                        
+                        // Lire le nombre de frames
+                        if (fread(&frames_count, 4, 1, ctx->input_file) != 1) break;
+                        ctx->avi_total_frames = frames_count;
+                        
+                        // Ignorer le reste du chunk avih
+                        fseek(ctx->input_file, subchunk_size - 16, SEEK_CUR);
+                    }
+                    else if (strncmp(subchunk_id, "strf", 4) == 0) {
+                        avi_bitmap_info_header_t bih;
+                        if (fread(&bih, sizeof(avi_bitmap_info_header_t), 1, ctx->input_file) != 1) break;
+                        
+                        ctx->width = bih.width;
+                        ctx->height = bih.height;
+                        stream_format = bih.compression;
+                        
+                        // Vérifier si c'est du MJPEG
+                        char format_str[5] = {0};
+                        memcpy(format_str, &stream_format, 4);
+                        ESP_LOGI(TAG, "Video format: %.4s, Width: %d, Height: %d", 
+                                format_str, ctx->width, ctx->height);
+                        
+                        // 'MJPG' en little endian = GPJM
+                        ctx->is_mjpeg = (stream_format == 0x47504A4D);
+                        
+                        found_header = true;
+                        
+                        // Ignorer le reste du chunk strf
+                        fseek(ctx->input_file, subchunk_size - sizeof(avi_bitmap_info_header_t), SEEK_CUR);
+                    }
+                    else {
+                        // Ignorer les chunks inconnus
+                        fseek(ctx->input_file, subchunk_size, SEEK_CUR);
+                    }
+                    
+                    // Ajustement pour l'alignement
+                    if (subchunk_size % 2 == 1) {
+                        fseek(ctx->input_file, 1, SEEK_CUR);
+                    }
+                }
+            }
+            else if (strncmp(list_type, "movi", 4) == 0) {
+                // On a trouvé les données vidéo
+                ctx->avi_data_offset = ftell(ctx->input_file);
+                ctx->avi_current_offset = ctx->avi_data_offset;
+                found_movi = true;
+                
+                ESP_LOGI(TAG, "Found movi LIST at offset %ld", ctx->avi_data_offset);
+                
+                // Estimer la taille des frames si non trouvée précédemment
+                if (frames_count > 0 && chunk_size > 4) {
+                    ctx->avi_frame_size = (chunk_size - 4) / frames_count;
+                    ESP_LOGI(TAG, "Estimated frame size: %d bytes", ctx->avi_frame_size);
+                }
+                
+                // Sortir de la boucle car on a trouvé ce qu'on cherchait
+                break;
+            }
+            else {
+                // Ignorer les autres types de list
+                fseek(ctx->input_file, chunk_size - 4, SEEK_CUR);  // -4 car on a déjà lu le type de liste
+            }
+        }
+        else {
+            // Ignorer les chunks inconnus
+            fseek(ctx->input_file, chunk_size, SEEK_CUR);
+        }
+        
+        // Ajustement pour l'alignement
+        if (chunk_size % 2 == 1) {
+            fseek(ctx->input_file, 1, SEEK_CUR);
+        }
+    }
+    
+    if (!found_header || !found_movi) {
+        ESP_LOGE(TAG, "AVI file is missing required chunks (hdrl or movi)");
+        return false;
+    }
+    
+    // Revenir au début des données vidéo
+    fseek(ctx->input_file, ctx->avi_data_offset, SEEK_SET);
+    ctx->avi_current_offset = ctx->avi_data_offset;
+    
+    ESP_LOGI(TAG, "AVI header parsed successfully: %dx%d, %d frames", 
+            ctx->width, ctx->height, ctx->avi_total_frames);
+    
+    return true;
+}
+
+// Lire une frame depuis un fichier AVI
+static bool read_file_avi_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
+                             size_t buffer_size, size_t *bytes_read) {
+    if (ctx->input_file == NULL) return false;
+    
+    // Si on commence la lecture, positionner au début des données
+    if (ctx->avi_current_offset == 0) {
+        if (!parse_avi_header(ctx)) {
+            ESP_LOGE(TAG, "Failed to parse AVI header");
+            return false;
+        }
+    }
+    
+    // Se positionner au bon endroit si on a modifié la position
+    if (ftell(ctx->input_file) != ctx->avi_current_offset) {
+        fseek(ctx->input_file, ctx->avi_current_offset, SEEK_SET);
+    }
+    
+    // Lire l'en-tête du chunk
+    char chunk_id[4];
+    uint32_t chunk_size;
+    
+    if (fread(chunk_id, 4, 1, ctx->input_file) != 1) {
+        ESP_LOGE(TAG, "Failed to read chunk ID or end of file");
+        // Essai de rebouclage sur le fichier
+        fseek(ctx->input_file, ctx->avi_data_offset, SEEK_SET);
+        ctx->avi_current_offset = ctx->avi_data_offset;
+        return false;
+    }
+    
+    if (fread(&chunk_size, 4, 1, ctx->input_file) != 1) {
+        ESP_LOGE(TAG, "Failed to read chunk size");
+        return false;
+    }
+    
+    // Vérifier si c'est un chunk de données vidéo (00dc, 00db, etc.)
+    if (chunk_id[0] == '0' && chunk_id[1] == '0' && 
+        (chunk_id[2] == 'd' || chunk_id[2] == 'w') && 
+        (chunk_id[3] == 'c' || chunk_id[3] == 'b')) {
+        
+        ESP_LOGD(TAG, "Video chunk: %.4s, Size: %d", chunk_id, chunk_size);
+        
+        // Limiter à la taille du buffer
+        size_t to_read = chunk_size > buffer_size ? buffer_size : chunk_size;
+        
+        *bytes_read = fread(buffer, 1, to_read, ctx->input_file);
+        
+        if (*bytes_read <= 0) {
+            ESP_LOGE(TAG, "Failed to read frame data");
+            return false;
+        }
+        
+        // Si MJPEG et pas de marqueur JPEG au début, chercher le marqueur
+        if (ctx->is_mjpeg && (buffer[0] != 0xFF || buffer[1] != 0xD8)) {
+            int marker_pos = find_jpeg_marker(buffer, *bytes_read);
+            if (marker_pos >= 0) {
+                ESP_LOGD(TAG, "Found JPEG marker at position %d", marker_pos);
+                memmove(buffer, buffer + marker_pos, *bytes_read - marker_pos);
+                *bytes_read -= marker_pos;
+            } else {
+                ESP_LOGE(TAG, "No JPEG marker found in frame data");
+                return false;
+            }
+        }
+        
+        // Mettre à jour l'offset pour la prochaine lecture
+        ctx->avi_current_offset = ftell(ctx->input_file);
+        
+        // Ajustement pour l'alignement
+        if (chunk_size % 2 == 1) {
+            fseek(ctx->input_file, 1, SEEK_CUR);
+            ctx->avi_current_offset = ftell(ctx->input_file);
+        }
+        
+        return true;
+    }
+    else {
+        // Ce n'est pas un chunk vidéo, l'ignorer
+        ESP_LOGD(TAG, "Skipping non-video chunk: %.4s, Size: %d", chunk_id, chunk_size);
+        fseek(ctx->input_file, chunk_size, SEEK_CUR);
+        
+        // Ajustement pour l'alignement
+        if (chunk_size % 2 == 1) {
+            fseek(ctx->input_file, 1, SEEK_CUR);
+        }
+        
+        ctx->avi_current_offset = ftell(ctx->input_file);
+        
+        // Si on atteint la fin du fichier, revenir au début des données
+        if (feof(ctx->input_file) || ctx->avi_current_offset >= ctx->avi_data_offset + chunk_size) {
+            ESP_LOGI(TAG, "Reached end of AVI file, restarting");
+            fseek(ctx->input_file, ctx->avi_data_offset, SEEK_SET);
+            ctx->avi_current_offset = ctx->avi_data_offset;
+        }
+        
+        // Continuer à chercher un chunk vidéo
+        return read_file_avi_frame(ctx, buffer, buffer_size, bytes_read);
+    }
+}
+
 // Lecture d'une frame MJPEG depuis un fichier
 static bool read_file_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
                              size_t buffer_size, size_t *bytes_read) {
     if (ctx->input_file == NULL) return false;
     
+    // Si c'est un fichier AVI, utiliser le lecteur AVI
+    if (ctx->is_avi) {
+        return read_file_avi_frame(ctx, buffer, buffer_size, bytes_read);
+    }
+    
+    // Sinon, utiliser le lecteur MJPEG original
     // Recherche du début d'un JPEG (SOI marker: FF D8)
     uint8_t marker[2];
     bool found_start = false;
@@ -279,7 +573,7 @@ static void ffmpeg_decode_task(void *arg) {
         
         consecutive_errors = 0; // Réinitialiser le compteur d'erreurs
         
-        ESP_LOGD(TAG, "Read %d bytes of MJPEG data", bytes_read);
+        ESP_LOGD(TAG, "Read %d bytes of video data", bytes_read);
         
         if (!decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
             ESP_LOGE(TAG, "Failed to decode JPEG frame");
@@ -327,6 +621,11 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
     new_ctx->height = 64;
     new_ctx->frame_count = 0;
     new_ctx->is_mjpeg = true;
+    new_ctx->is_avi = false;
+    new_ctx->avi_data_offset = 0;
+    new_ctx->avi_current_offset = 0;
+    new_ctx->avi_frame_size = 0;
+    new_ctx->avi_total_frames = 0;
     new_ctx->http_client = NULL;
     new_ctx->input_file = NULL;
 
@@ -357,6 +656,18 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
             vSemaphoreDelete(new_ctx->mutex);
             free(new_ctx);
             return ESP_ERR_NOT_FOUND;
+        }
+        
+        // Vérifier si c'est un fichier AVI
+        char file_header[12];
+        size_t read_bytes = fread(file_header, 1, 12, new_ctx->input_file);
+        fseek(new_ctx->input_file, 0, SEEK_SET); // Revenir au début
+        
+        if (read_bytes >= 12 && 
+            strncmp(file_header, "RIFF", 4) == 0 && 
+            strncmp(file_header + 8, "AVI ", 4) == 0) {
+            ESP_LOGI(TAG, "File is in AVI format");
+            new_ctx->is_avi = true;
         }
     }
     // HTTP client sera initialisé dans la tâche pour éviter les problèmes de timeout
@@ -450,3 +761,4 @@ esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int heig
     
     return ESP_OK;
 }
+

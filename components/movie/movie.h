@@ -4,31 +4,8 @@
 #include "esphome/core/color.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp32_ffmpeg.h"
 
-// Types pour FFmpeg
-typedef enum {
-    ESP_FFMPEG_SOURCE_TYPE_FILE,
-    ESP_FFMPEG_SOURCE_TYPE_HTTP
-} esp_ffmpeg_source_type_t;
-
-// Structures FFmpeg
-typedef struct {
-    uint8_t *data;
-    int width;
-    int height;
-    // Autres champs si nécessaire
-} esp_ffmpeg_frame_t;
-
-typedef void* esp_ffmpeg_context_t;
-
-// Prototypes des fonctions FFmpeg
-extern "C" {
-    esp_err_t esp_ffmpeg_init(const char *source, esp_ffmpeg_source_type_t source_type, 
-                             void (*frame_callback)(esp_ffmpeg_frame_t*, void*), 
-                             void *user_data, esp_ffmpeg_context_t *ctx);
-    esp_err_t esp_ffmpeg_start(esp_ffmpeg_context_t ctx);
-    esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t ctx);
-}
 
 namespace esphome {
 namespace movie {

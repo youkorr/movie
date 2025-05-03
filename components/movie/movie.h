@@ -45,6 +45,8 @@ class MoviePlayer : public Component {
   // Nouvelles méthodes
   void set_threshold(uint8_t threshold);
   void set_scaling_mode(ScalingMode mode);
+  void set_format(VideoFormat format) { this->default_format_ = format; }
+
   
  protected:
   static void ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_data);
@@ -59,6 +61,7 @@ class MoviePlayer : public Component {
   
   bool playing_{false};
   std::string current_path_;
+  VideoFormat default_format_{VIDEO_FORMAT_AUTO};
   VideoFormat current_format_{VIDEO_FORMAT_MJPEG};
   esp_ffmpeg_source_type_t current_source_type_;
   esp_ffmpeg_context_t *ffmpeg_ctx_{nullptr};

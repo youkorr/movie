@@ -35,9 +35,10 @@ namespace movie {
 
 // Définition des formats vidéo - assurez-vous d'utiliser FORMAT_MJPEG et non VIDEO_FORMAT_MJPEG
 enum VideoFormat {
-    FORMAT_MJPEG,
-    FORMAT_BINARY,
-    FORMAT_RGB565
+    FORMAT_MJPEG= 1,
+    FORMAT_AVI = 1,
+    FORMAT_BINARY= 1,
+    FORMAT_RGB565= 1,
 };
 
 class MoviePlayer : public Component {

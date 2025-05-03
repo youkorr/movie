@@ -470,7 +470,12 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
     
     // Extraire le type de contenu pour détecter le format
     char content_type[64] = {0};
-    if (esp_http_client_get_header(ctx->http_client, "Content-Type", content_type, sizeof(content_type)) > 0) {
+    char *content_type_ptr = NULL;
+    if (esp_http_client_get_header(ctx->http_client, "Content-Type", &content_type_ptr) == ESP_OK && content_type_ptr != NULL) {
+        // Copier la valeur dans notre buffer pour éviter des problèmes de mémoire
+        strncpy(content_type, content_type_ptr, sizeof(content_type) - 1);
+        content_type[sizeof(content_type) - 1] = '\0'; // S'assurer que c'est terminé par un 0
+        
         ESP_LOGI(TAG, "Content type: %s, length: %d", content_type, content_length);
         
         // Détection des types de fichiers vidéo

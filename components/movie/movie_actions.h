@@ -29,7 +29,7 @@ class PlayFileAction : public Action<> {
  protected:
   MoviePlayer *player_;
   std::string file_path_;
-  VideoFormat format_{FORMAT_MJPEG};
+  VideoFormat format_{VIDEO_FORMAT_AUTO};  // Modifié pour utiliser AUTO par défaut
 };
 
 class PlayHttpStreamAction : public Action<> {
@@ -54,7 +54,7 @@ class PlayHttpStreamAction : public Action<> {
  protected:
   MoviePlayer *player_;
   std::string url_;
-  VideoFormat format_{FORMAT_MJPEG};
+  VideoFormat format_{VIDEO_FORMAT_AUTO};  // Modifié pour utiliser AUTO par défaut
 };
 
 class StopAction : public Action<> {
@@ -71,3 +71,4 @@ class StopAction : public Action<> {
 
 }  // namespace movie
 }  // namespace esphome
+

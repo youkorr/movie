@@ -64,10 +64,6 @@ struct esp_ffmpeg_context_s {
     long avi_current_offset;  // Offset courant de lecture
     uint32_t avi_frame_size;  // Taille moyenne des frames
     uint32_t avi_total_frames; // Nombre total de frames
-    
-    // Pour MP4
-    bool is_mp4;
-    int retry_count;
 };
 
 // Décodage JPEG fictif (remplacer par tjpgd si besoin)
@@ -419,39 +415,19 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
     
     // Si c'est la première requête ou si on a besoin de réinitialiser
     if (ctx->http_client == NULL) {
-        // Réduire la taille du buffer HTTP pour éviter les problèmes d'allocation
-        size_t http_buffer_size = buffer_size > 8192 ? 8192 : buffer_size;
-        
         esp_http_client_config_t config = {
             .url = ctx->source_url,
             .timeout_ms = 5000,
-            .buffer_size = http_buffer_size,
-            .disable_auto_redirect = false,
+            .buffer_size = buffer_size,
         };
-        
-        // Essayer d'allouer avec une taille plus petite en cas d'échec
         ctx->http_client = esp_http_client_init(&config);
         if (ctx->http_client == NULL) {
-            ESP_LOGE(TAG, "Failed to initialize HTTP client with buffer size %d", http_buffer_size);
-            
-            // Réessayer avec un buffer plus petit
-            config.buffer_size = 4096;  // Taille minimale
-            ctx->http_client = esp_http_client_init(&config);
-            
-            if (ctx->http_client == NULL) {
-                ESP_LOGE(TAG, "Failed to initialize HTTP client even with reduced buffer");
-                return false;
-            }
-            ESP_LOGI(TAG, "HTTP client initialized with reduced buffer size");
+            ESP_LOGE(TAG, "Failed to initialize HTTP client");
+            return false;
         }
     }
     
-    // Ouvrir la connexion avec méthode GET explicite
-    err = esp_http_client_set_method(ctx->http_client, HTTP_METHOD_GET);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set HTTP method: %s", esp_err_to_name(err));
-    }
-    
+    // Ouvrir la connexion
     err = esp_http_client_open(ctx->http_client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
@@ -468,46 +444,21 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
         return false;
     }
     
-    // Extraire le type de contenu pour détecter le format
-    char *content_type = NULL;
-    if (esp_http_client_get_header(ctx->http_client, "Content-Type", &content_type) == ESP_OK && content_type != NULL) {
-        ESP_LOGI(TAG, "Content type: %s, length: %d", content_type, content_length);
-        
-        // Détection des types de fichiers vidéo
-        bool is_mp4 = (strstr(content_type, "mp4") != NULL || strstr(content_type, "video/mp4") != NULL);
-        bool is_avi = (strstr(content_type, "avi") != NULL || strstr(content_type, "video/avi") != NULL);
-        
-        if (is_mp4) {
-            ESP_LOGW(TAG, "MP4 format detected - not directly supported, attempting to extract JPEG frames");
-            ctx->is_mp4 = true;
-        } else if (is_avi) {
-            ESP_LOGI(TAG, "AVI format detected via HTTP");
-            ctx->is_avi = true;
-        }
-    }
-    
     // Limiter la lecture au buffer_size
     int to_read = content_length > 0 && content_length < buffer_size ? 
                   content_length : buffer_size;
     
-    // Lire le corps avec gestion des échecs
+    // Lire le corps
     int total_read = 0;
     int remaining = to_read;
-    int retry_count = 0;
-    const int max_retries = 3;
     
-    while (remaining > 0 && retry_count < max_retries) {
+    while (remaining > 0) {
         int read_len = esp_http_client_read(ctx->http_client, 
-                                          (char*)buffer + total_read, 
-                                          remaining);
+                                           (char*)buffer + total_read, 
+                                           remaining);
         if (read_len <= 0) {
-            ESP_LOGW(TAG, "HTTP read returned %d, retry %d/%d", 
-                   read_len, retry_count + 1, max_retries);
-            retry_count++;
-            vTaskDelay(pdMS_TO_TICKS(100));  // Petit délai avant nouvelle tentative
-            continue;
+            break;
         }
-        
         total_read += read_len;
         remaining -= read_len;
     }
@@ -515,36 +466,26 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
     esp_http_client_close(ctx->http_client);
     
     if (total_read <= 0) {
-        ESP_LOGE(TAG, "HTTP client read failed after %d retries", retry_count);
+        ESP_LOGE(TAG, "HTTP client read failed");
         return false;
     }
     
     *bytes_read = total_read;
     
-    // Pour MP4: traitement spécial pour extraire les keyframes JPEG si possible
-    if (ctx->is_mp4) {
-        int marker_pos = find_jpeg_marker(buffer, total_read);
-        if (marker_pos >= 0) {
-            ESP_LOGI(TAG, "Found JPEG marker in MP4 data at position %d", marker_pos);
-            memmove(buffer, buffer + marker_pos, total_read - marker_pos);
-            *bytes_read = total_read - marker_pos;
-        } else {
-            ESP_LOGW(TAG, "No JPEG marker found in MP4 data, continuing anyway");
-            // On continue quand même, peut-être qu'on aura plus de chance avec les frames suivantes
-        }
-    }
-    // Pour d'autres formats (MJPEG ou inconnus): vérifier pour JPEG
-    else if (!ctx->is_avi && (buffer[0] != 0xFF || buffer[1] != 0xD8)) {
-        ESP_LOGW(TAG, "Data doesn't start with JPEG marker, looking for marker");
+    // Vérifier si les données commencent par un marqueur JPEG
+    // Si non, rechercher le marqueur dans les données
+    if (buffer[0] != 0xFF || buffer[1] != 0xD8) {
+        ESP_LOGW(TAG, "HTTP data doesn't start with JPEG marker, looking for marker");
         int marker_pos = find_jpeg_marker(buffer, total_read);
         
         if (marker_pos >= 0) {
             ESP_LOGI(TAG, "Found JPEG marker at position %d", marker_pos);
+            // Déplacer les données pour commencer au marqueur
             memmove(buffer, buffer + marker_pos, total_read - marker_pos);
             *bytes_read = total_read - marker_pos;
         } else {
-            ESP_LOGW(TAG, "No JPEG marker found in data");
-            // On continue malgré tout - peut-être pas une frame JPEG
+            ESP_LOGE(TAG, "No JPEG marker found in HTTP data");
+            return false;
         }
     }
     
@@ -623,15 +564,7 @@ static void ffmpeg_decode_task(void *arg) {
             
             if (consecutive_errors >= max_consecutive_errors) {
                 ESP_LOGE(TAG, "Too many consecutive read errors, stopping decoder");
-                // Si HTTP, essayer de réinitialiser la connexion
-                if (ctx->source_type == ESP_FFMPEG_SOURCE_TYPE_HTTP && ctx->http_client) {
-                    ESP_LOGW(TAG, "Trying to reset HTTP connection");
-                    esp_http_client_cleanup(ctx->http_client);
-                    ctx->http_client = NULL;
-                    consecutive_errors = max_consecutive_errors - 1; // Donner une chance de plus
-                } else {
-                    break;
-                }
+                break;
             }
             
             vTaskDelay(delay_time); // Attendre avant de réessayer
@@ -642,33 +575,8 @@ static void ffmpeg_decode_task(void *arg) {
         
         ESP_LOGD(TAG, "Read %d bytes of video data", bytes_read);
         
-        // Pour MP4 et autres formats, essayer plusieurs fois de trouver un JPEG
-        bool decoded = false;
-        int decode_attempts = 0;
-        const int max_decode_attempts = 3;
-        
-        while (!decoded && decode_attempts < max_decode_attempts) {
-            if (decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
-                decoded = true;
-                break;
-            }
-            
-            // Si échec du décodage, essayer de trouver un autre marqueur JPEG plus loin dans le buffer
-            int marker_pos = find_jpeg_marker(ctx->buffer + 2, bytes_read - 2);
-            if (marker_pos < 0) {
-                ESP_LOGE(TAG, "No additional JPEG marker found in buffer");
-                break;
-            }
-            
-            marker_pos += 2; // Ajuster pour le début du buffer
-            ESP_LOGW(TAG, "Trying alternate JPEG marker at position %d", marker_pos);
-            memmove(ctx->buffer, ctx->buffer + marker_pos, bytes_read - marker_pos);
-            bytes_read -= marker_pos;
-            decode_attempts++;
-        }
-        
-        if (!decoded) {
-            ESP_LOGE(TAG, "Failed to decode JPEG frame after %d attempts", decode_attempts);
+        if (!decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
+            ESP_LOGE(TAG, "Failed to decode JPEG frame");
             vTaskDelay(delay_time);
             continue;
         }
@@ -700,21 +608,6 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
                          esp_ffmpeg_context_t **ctx) {
     if (!source_url || !ctx) return ESP_ERR_INVALID_ARG;
 
-    // Détection du format basée sur l'extension du fichier
-    bool is_avi = false;
-    bool is_mp4 = false;
-    
-    const char *ext = strrchr(source_url, '.');
-    if (ext) {
-        is_avi = (strcasecmp(ext, ".avi") == 0);
-        is_mp4 = (strcasecmp(ext, ".mp4") == 0);
-    }
-    
-    // Si c'est un MP4, avertir que le support est limité
-    if (is_mp4) {
-        ESP_LOGW(TAG, "MP4 format detected. Note: limited MP4 support, only MJPEG frames will be extracted");
-    }
-
     esp_ffmpeg_context_t *new_ctx = calloc(1, sizeof(esp_ffmpeg_context_t));
     if (!new_ctx) return ESP_ERR_NO_MEM;
 
@@ -728,13 +621,11 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
     new_ctx->height = 64;
     new_ctx->frame_count = 0;
     new_ctx->is_mjpeg = true;
-    new_ctx->is_avi = is_avi;
-    new_ctx->is_mp4 = is_mp4;
+    new_ctx->is_avi = false;
     new_ctx->avi_data_offset = 0;
     new_ctx->avi_current_offset = 0;
     new_ctx->avi_frame_size = 0;
     new_ctx->avi_total_frames = 0;
-    new_ctx->retry_count = 0;
     new_ctx->http_client = NULL;
     new_ctx->input_file = NULL;
 
@@ -767,18 +658,16 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
             return ESP_ERR_NOT_FOUND;
         }
         
-        // Vérifier si c'est un fichier AVI si pas déjà détecté
-        if (!is_avi) {
-            char file_header[12];
-            size_t read_bytes = fread(file_header, 1, 12, new_ctx->input_file);
-            fseek(new_ctx->input_file, 0, SEEK_SET); // Revenir au début
-            
-            if (read_bytes >= 12 && 
-                strncmp(file_header, "RIFF", 4) == 0 && 
-                strncmp(file_header + 8, "AVI ", 4) == 0) {
-                ESP_LOGI(TAG, "File is in AVI format");
-                new_ctx->is_avi = true;
-            }
+        // Vérifier si c'est un fichier AVI
+        char file_header[12];
+        size_t read_bytes = fread(file_header, 1, 12, new_ctx->input_file);
+        fseek(new_ctx->input_file, 0, SEEK_SET); // Revenir au début
+        
+        if (read_bytes >= 12 && 
+            strncmp(file_header, "RIFF", 4) == 0 && 
+            strncmp(file_header + 8, "AVI ", 4) == 0) {
+            ESP_LOGI(TAG, "File is in AVI format");
+            new_ctx->is_avi = true;
         }
     }
     // HTTP client sera initialisé dans la tâche pour éviter les problèmes de timeout
@@ -872,6 +761,7 @@ esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int heig
     
     return ESP_OK;
 }
+
 
 
 

@@ -33,12 +33,11 @@ extern "C" {
 namespace esphome {
 namespace movie {
 
-// Définition des formats vidéo - assurez-vous d'utiliser FORMAT_MJPEG et non VIDEO_FORMAT_MJPEG
 enum VideoFormat {
-    FORMAT_MJPEG= 1,
-    FORMAT_AVI = 1,
-    FORMAT_BINARY= 1,
-    FORMAT_RGB565= 1,
+    FORMAT_MJPEG = 1,
+    FORMAT_AVI = 2,
+    FORMAT_BINARY = 3,
+    FORMAT_RGB565 = 4,
 };
 
 class MoviePlayer : public Component {

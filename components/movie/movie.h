@@ -70,7 +70,7 @@ protected:
     std::string current_path_{};
     VideoFormat current_format_{FORMAT_MJPEG};
     esp_ffmpeg_source_type_t current_source_type_{ESP_FFMPEG_SOURCE_TYPE_FILE};
-    esp_ffmpeg_context_t ffmpeg_ctx_{nullptr};
+    esp_ffmpeg_context_t *ffmpeg_ctx_{nullptr};
 
     // Statistiques
     uint32_t frames_displayed_{0};

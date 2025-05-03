@@ -1,8 +1,7 @@
 #pragma once
-
 #include "esphome/core/component.h"
 #include "esphome/components/display/display_buffer.h"
-#include "esphome/core/color.h"  // Ajouté pour accéder à esphome::Color
+#include "esphome/core/color.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -12,7 +11,7 @@ typedef enum {
     ESP_FFMPEG_SOURCE_TYPE_HTTP
 } esp_ffmpeg_source_type_t;
 
-// Structures FFmpeg (à adapter selon votre implémentation FFmpeg)
+// Structures FFmpeg
 typedef struct {
     uint8_t *data;
     int width;
@@ -22,7 +21,7 @@ typedef struct {
 
 typedef void* esp_ffmpeg_context_t;
 
-// Prototypes des fonctions FFmpeg (à adapter selon votre implémentation)
+// Prototypes des fonctions FFmpeg
 extern "C" {
     esp_err_t esp_ffmpeg_init(const char *source, esp_ffmpeg_source_type_t source_type, 
                              void (*frame_callback)(esp_ffmpeg_frame_t*, void*), 
@@ -34,6 +33,7 @@ extern "C" {
 namespace esphome {
 namespace movie {
 
+// Définition des formats vidéo - assurez-vous d'utiliser FORMAT_MJPEG et non VIDEO_FORMAT_MJPEG
 enum VideoFormat {
     FORMAT_MJPEG,
     FORMAT_BINARY,
@@ -44,13 +44,19 @@ class MoviePlayer : public Component {
 public:
     MoviePlayer();
     ~MoviePlayer();
-
     void setup() override;
     void loop() override;
     void dump_config() override;
-
+    
     // Méthodes pour configurer le lecteur
     void set_display(display::DisplayBuffer *display) { this->display_ = display; }
+    
+    // Ajout des méthodes qui manquent selon les erreurs dans le YAML
+    void set_width(int width) { this->width_ = width; }
+    void set_height(int height) { this->height_ = height; }
+    void set_format(VideoFormat format) { this->current_format_ = format; }
+    
+    // Les méthodes existantes
     void set_dimensions(int width, int height) {
         this->width_ = width;
         this->height_ = height;
@@ -58,19 +64,19 @@ public:
     void set_buffer_size(size_t size) { this->buffer_size_ = size; }
     void set_fps(int fps) { this->fps_ = fps; }
     void set_http_timeout(int timeout_ms) { this->http_timeout_ms_ = timeout_ms; }
-
+    
     // Méthodes pour la lecture
     bool play_file(const std::string &file_path, VideoFormat format);
     bool play_http_stream(const std::string &url, VideoFormat format);
     void stop();
-
+    
     // Callback statique pour FFmpeg
     static void ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_data);
 
 protected:
     // Méthode d'affichage d'une frame
     bool display_frame(const uint8_t *data, int width, int height);
-
+    
     // Affichage
     display::DisplayBuffer *display_{nullptr};
     int width_{320};

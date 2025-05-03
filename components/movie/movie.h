@@ -73,6 +73,10 @@ public:
     // Callback statique pour FFmpeg
     static void ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_data);
 
+    static const VideoFormat VIDEO_FORMAT_MJPEG = FORMAT_MJPEG;
+    static const VideoFormat VIDEO_FORMAT_AVI = FORMAT_AVI;
+
+
 protected:
     // Méthode d'affichage d'une frame
     bool display_frame(const uint8_t *data, int width, int height);

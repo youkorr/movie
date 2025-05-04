@@ -73,6 +73,9 @@ class MoviePlayer : public Component {
   SemaphoreHandle_t mutex_{nullptr};
 
   TaskHandle_t ffmpeg_task_{nullptr};
+
+  bool start_ffmpeg_async();
+  VideoFormat resolve_format(const std::string &path, VideoFormat format
   
   // Nouveaux membres
   uint8_t threshold_{128};  // Valeur par défaut pour la conversion monochrome

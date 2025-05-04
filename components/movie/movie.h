@@ -51,6 +51,9 @@ class MoviePlayer : public Component {
  protected:
   static void ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_data);
   bool display_frame(const uint8_t *data, int width, int height);
+
+  bool start_ffmpeg_async();
+  VideoFormat resolve_format(const std::string &path, VideoFormat format);
   
   display::DisplayBuffer *display_{nullptr};
   int width_{128};
@@ -74,8 +77,7 @@ class MoviePlayer : public Component {
 
   TaskHandle_t ffmpeg_task_{nullptr};
 
-  bool start_ffmpeg_async();
-  VideoFormat resolve_format(const std::string &path, VideoFormat format
+
   
   // Nouveaux membres
   uint8_t threshold_{128};  // Valeur par défaut pour la conversion monochrome

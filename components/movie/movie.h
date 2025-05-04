@@ -2,7 +2,8 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/display/display_buffer.h"
-#include "esp32_ffmpeg.h"  // Inclure votre code FFmpeg
+
+
 
 namespace esphome {
 namespace movie {

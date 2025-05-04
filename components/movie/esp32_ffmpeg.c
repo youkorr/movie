@@ -469,8 +469,8 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
     }
     
     // Extraire le type de contenu pour détecter le format
-    char content_type[64] = {0};
-    if (esp_http_client_get_header(ctx->http_client, "Content-Type", content_type, sizeof(content_type)) > 0) {
+    char *content_type = NULL;
+    if (esp_http_client_get_header(ctx->http_client, "Content-Type", &content_type) == ESP_OK && content_type != NULL) {
         ESP_LOGI(TAG, "Content type: %s, length: %d", content_type, content_length);
         
         // Détection des types de fichiers vidéo
@@ -530,7 +530,6 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
             *bytes_read = total_read - marker_pos;
         } else {
             ESP_LOGW(TAG, "No JPEG marker found in MP4 data, continuing anyway");
-            // On continue quand même, peut-être qu'on aura plus de chance avec les frames suivantes
         }
     }
     // Pour d'autres formats (MJPEG ou inconnus): vérifier pour JPEG
@@ -544,12 +543,12 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
             *bytes_read = total_read - marker_pos;
         } else {
             ESP_LOGW(TAG, "No JPEG marker found in data");
-            // On continue malgré tout - peut-être pas une frame JPEG
         }
     }
     
     return true;
 }
+
 
 // Lecture d'une frame MJPEG (wrapper)
 static bool read_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,

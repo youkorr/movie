@@ -9,6 +9,9 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 
 static const char *TAG = "esp32_ffmpeg";
 
@@ -64,8 +67,178 @@ struct esp_ffmpeg_context_s {
     long avi_current_offset;  // Offset courant de lecture
     uint32_t avi_frame_size;  // Taille moyenne des frames
     uint32_t avi_total_frames; // Nombre total de frames
+    // For MP4 and other formats using FFmpeg
+    bool is_mp4;
+    AVFormatContext *fmt_ctx;
+    AVCodecContext *codec_ctx;
+    AVStream *video_stream;
+    struct SwsContext *sws_ctx;
+    AVPacket *packet;
+    AVFrame *frame;
+    int video_stream_idx;
 };
 
+static void init_ffmpeg_libs() {
+    static bool initialized = false;
+    if (!initialized) {
+        av_register_all();
+        avcodec_register_all();
+        avformat_network_init();
+        initialized = true;
+        ESP_LOGI(TAG, "FFmpeg libraries initialized");
+    }
+}
+static bool open_mp4_source(esp_ffmpeg_context_t *ctx) {
+    // Initialize FFmpeg components
+    ctx->fmt_ctx = avformat_alloc_context();
+    if (!ctx->fmt_ctx) {
+        ESP_LOGE(TAG, "Failed to allocate format context");
+        return false;
+    }
+    
+    // Open input
+    if (avformat_open_input(&ctx->fmt_ctx, ctx->source_url, NULL, NULL) != 0) {
+        ESP_LOGE(TAG, "Failed to open input: %s", ctx->source_url);
+        return false;
+    }
+    
+    // Find stream info
+    if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
+        ESP_LOGE(TAG, "Failed to find stream info");
+        return false;
+    }
+    
+    // Find video stream
+    ctx->video_stream_idx = -1;
+    for (int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+        if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ctx->video_stream_idx = i;
+            break;
+        }
+    }
+    
+    if (ctx->video_stream_idx == -1) {
+        ESP_LOGE(TAG, "No video stream found");
+        return false;
+    }
+    
+    ctx->video_stream = ctx->fmt_ctx->streams[ctx->video_stream_idx];
+    
+    // Find decoder
+    AVCodec *dec = avcodec_find_decoder(ctx->video_stream->codecpar->codec_id);
+    if (!dec) {
+        ESP_LOGE(TAG, "Failed to find decoder");
+        return false;
+    }
+    
+    // Allocate codec context
+    ctx->codec_ctx = avcodec_alloc_context3(dec);
+    if (!ctx->codec_ctx) {
+        ESP_LOGE(TAG, "Failed to allocate codec context");
+        return false;
+    }
+    
+    // Copy codec parameters
+    if (avcodec_parameters_to_context(ctx->codec_ctx, ctx->video_stream->codecpar) < 0) {
+        ESP_LOGE(TAG, "Failed to copy codec parameters");
+        return false;
+    }
+    
+    // Open codec
+    if (avcodec_open2(ctx->codec_ctx, dec, NULL) < 0) {
+        ESP_LOGE(TAG, "Failed to open codec");
+        return false;
+    }
+    
+    // Update video dimensions
+    ctx->width = ctx->codec_ctx->width;
+    ctx->height = ctx->codec_ctx->height;
+    
+    // Create scaling context for converting to RGB565
+    ctx->sws_ctx = sws_getContext(
+        ctx->width, ctx->height, ctx->codec_ctx->pix_fmt,
+        ctx->width, ctx->height, AV_PIX_FMT_RGB565,
+        SWS_BILINEAR, NULL, NULL, NULL);
+    
+    if (!ctx->sws_ctx) {
+        ESP_LOGE(TAG, "Failed to create scaling context");
+        return false;
+    }
+    
+    // Allocate packet and frame
+    ctx->packet = av_packet_alloc();
+    ctx->frame = av_frame_alloc();
+    
+    if (!ctx->packet || !ctx->frame) {
+        ESP_LOGE(TAG, "Failed to allocate packet or frame");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "MP4 source opened successfully: %dx%d", ctx->width, ctx->height);
+    ctx->is_mp4 = true;
+    return true;
+}
+
+// Read a frame from MP4
+static bool read_mp4_frame(esp_ffmpeg_context_t *ctx, uint16_t *rgb565_buffer) {
+    int ret;
+    bool got_frame = false;
+    
+    // Read frames until we get a video frame
+    while (!got_frame) {
+        ret = av_read_frame(ctx->fmt_ctx, ctx->packet);
+        
+        if (ret < 0) {
+            // End of file or error
+            if (ret == AVERROR_EOF) {
+                // Seek back to beginning for looping
+                av_seek_frame(ctx->fmt_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+                continue;
+            } else {
+                ESP_LOGE(TAG, "Error reading frame");
+                return false;
+            }
+        }
+        
+        // Process only video packets
+        if (ctx->packet->stream_index == ctx->video_stream_idx) {
+            // Send packet to decoder
+            ret = avcodec_send_packet(ctx->codec_ctx, ctx->packet);
+            if (ret < 0) {
+                ESP_LOGE(TAG, "Error sending packet to decoder");
+                av_packet_unref(ctx->packet);
+                return false;
+            }
+            
+            // Get decoded frame
+            ret = avcodec_receive_frame(ctx->codec_ctx, ctx->frame);
+            if (ret == 0) {
+                // Frame successfully decoded
+                got_frame = true;
+                
+                // Convert frame to RGB565
+                const uint8_t *src_data[4] = { ctx->frame->data[0], ctx->frame->data[1], ctx->frame->data[2], NULL };
+                int src_linesize[4] = { ctx->frame->linesize[0], ctx->frame->linesize[1], ctx->frame->linesize[2], 0 };
+                uint8_t *dst_data[4] = { (uint8_t*)rgb565_buffer, NULL, NULL, NULL };
+                int dst_linesize[4] = { ctx->width * sizeof(uint16_t), 0, 0, 0 };
+                
+                sws_scale(ctx->sws_ctx, src_data, src_linesize, 0, ctx->height, dst_data, dst_linesize);
+            } else if (ret != AVERROR(EAGAIN)) {
+                ESP_LOGE(TAG, "Error receiving frame from decoder");
+                av_packet_unref(ctx->packet);
+                return false;
+            }
+        }
+        
+        av_packet_unref(ctx->packet);
+        
+        if (got_frame) {
+            break;
+        }
+    }
+    
+    return true;
+}
 // Décodage JPEG fictif (remplacer par tjpgd si besoin)
 static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
                         uint16_t *rgb565_buffer, int width, int height) {
@@ -516,7 +689,17 @@ static void ffmpeg_decode_task(void *arg) {
     
     ESP_LOGI(TAG, "Decoder task started with stack size: %d", uxTaskGetStackHighWaterMark(NULL));
 
-    // Allouer la frame RGB565 (PSRAM si dispo)
+    // Detect MP4 format based on extension or HTTP content type
+    if (ctx->source_url && strstr(ctx->source_url, ".mp4") != NULL) {
+        if (!open_mp4_source(ctx)) {
+            ESP_LOGE(TAG, "Failed to open MP4 source");
+            ctx->running = false;
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    // Allocate the RGB565 buffer
     size_t rgb565_size = ctx->width * ctx->height * sizeof(uint16_t);
     uint16_t *rgb565_buffer = NULL;
     
@@ -543,47 +726,41 @@ static void ffmpeg_decode_task(void *arg) {
         .pts = 0
     };
 
-    const TickType_t delay_time = pdMS_TO_TICKS(100); // 10 FPS
+    const TickType_t delay_time = pdMS_TO_TICKS(33); // ~30 FPS
     int consecutive_errors = 0;
     const int max_consecutive_errors = 5;
 
     while (ctx->running) {
-        // Vérifier la stack disponible
-        UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
-        ESP_LOGD(TAG, "Stack remaining: %d bytes", stack_remaining);
+        bool success = false;
         
-        if (stack_remaining < 256) {
-            ESP_LOGW(TAG, "Stack space getting low: %d bytes", stack_remaining);
+        // Process based on format
+        if (ctx->is_mp4) {
+            success = read_mp4_frame(ctx, rgb565_buffer);
+        } else if (ctx->is_avi || ctx->is_mjpeg) {
+            size_t bytes_read = 0;
+            success = read_mjpeg_frame(ctx, ctx->buffer, ctx->buffer_size, &bytes_read);
+            
+            if (success) {
+                success = decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height);
+            }
         }
         
-        size_t bytes_read = 0;
-        bool read_success = read_mjpeg_frame(ctx, ctx->buffer, ctx->buffer_size, &bytes_read);
-        
-        if (!read_success) {
-            ESP_LOGW(TAG, "Failed to read frame, consecutive errors: %d", ++consecutive_errors);
+        if (!success) {
+            ESP_LOGW(TAG, "Failed to read/decode frame, consecutive errors: %d", ++consecutive_errors);
             
             if (consecutive_errors >= max_consecutive_errors) {
-                ESP_LOGE(TAG, "Too many consecutive read errors, stopping decoder");
+                ESP_LOGE(TAG, "Too many consecutive errors, stopping decoder");
                 break;
             }
             
-            vTaskDelay(delay_time); // Attendre avant de réessayer
-            continue;
-        }
-        
-        consecutive_errors = 0; // Réinitialiser le compteur d'erreurs
-        
-        ESP_LOGD(TAG, "Read %d bytes of video data", bytes_read);
-        
-        if (!decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
-            ESP_LOGE(TAG, "Failed to decode JPEG frame");
             vTaskDelay(delay_time);
             continue;
         }
         
+        consecutive_errors = 0;
         frame.pts++;
         
-        // Appeler le callback si défini
+        // Call the callback if defined
         if (ctx->frame_callback) {
             ctx->frame_callback(&frame, ctx->user_data);
         }
@@ -592,15 +769,29 @@ static void ffmpeg_decode_task(void *arg) {
         vTaskDelay(delay_time);
     }
 
-    // Nettoyage
+    // Cleanup
     free(rgb565_buffer);
+    
+    // Clean up FFmpeg resources if needed
+    if (ctx->is_mp4) {
+        if (ctx->sws_ctx) sws_freeContext(ctx->sws_ctx);
+        if (ctx->frame) av_frame_free(&ctx->frame);
+        if (ctx->packet) av_packet_free(&ctx->packet);
+        if (ctx->codec_ctx) {
+            avcodec_close(ctx->codec_ctx);
+            avcodec_free_context(&ctx->codec_ctx);
+        }
+        if (ctx->fmt_ctx) {
+            avformat_close_input(&ctx->fmt_ctx);
+            avformat_free_context(ctx->fmt_ctx);
+        }
+    }
+    
     ESP_LOGI(TAG, "Decoder task finished, processed %d frames", ctx->frame_count);
 
     ctx->running = false;
     vTaskDelete(NULL);
 }
-
-// Initialisation
 esp_err_t esp_ffmpeg_init(const char *source_url,
                          esp_ffmpeg_source_type_t source_type,
                          esp_ffmpeg_frame_callback_t frame_callback,
@@ -622,6 +813,7 @@ esp_err_t esp_ffmpeg_init(const char *source_url,
     new_ctx->frame_count = 0;
     new_ctx->is_mjpeg = true;
     new_ctx->is_avi = false;
+    new_ctx->is_mp4 = false;
     new_ctx->avi_data_offset = 0;
     new_ctx->avi_current_offset = 0;
     new_ctx->avi_frame_size = 0;
@@ -704,13 +896,13 @@ esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx) {
     if (!ctx) return ESP_ERR_INVALID_ARG;
     if (!ctx->running) return ESP_OK;
     
-    // Signaler l'arrêt
+    // Signal the task to stop
     ctx->running = false;
     
-    // Attendre que la tâche se termine proprement
+    // Wait for the task to finish cleanly
     vTaskDelay(pdMS_TO_TICKS(200));
     
-    // Nettoyage des ressources
+    // Clean up resources based on source type
     if (ctx->source_type == ESP_FFMPEG_SOURCE_TYPE_FILE && ctx->input_file) {
         fclose(ctx->input_file);
         ctx->input_file = NULL;
@@ -720,7 +912,22 @@ esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx) {
         ctx->http_client = NULL;
     }
     
-    // Libérer la mémoire
+    // Clean up FFmpeg resources if needed (already done in task, this is a backup)
+    if (ctx->is_mp4) {
+        if (ctx->sws_ctx) sws_freeContext(ctx->sws_ctx);
+        if (ctx->frame) av_frame_free(&ctx->frame);
+        if (ctx->packet) av_packet_free(&ctx->packet);
+        if (ctx->codec_ctx) {
+            avcodec_close(ctx->codec_ctx);
+            avcodec_free_context(&ctx->codec_ctx);
+        }
+        if (ctx->fmt_ctx) {
+            avformat_close_input(&ctx->fmt_ctx);
+            avformat_free_context(ctx->fmt_ctx);
+        }
+    }
+    
+    // Free memory
     free(ctx->buffer);
     free(ctx->source_url);
     vSemaphoreDelete(ctx->mutex);
@@ -728,6 +935,7 @@ esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx) {
     
     return ESP_OK;
 }
+
 
 esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int height, int dst_format) {
     if (!src || !dst) return ESP_ERR_INVALID_ARG;

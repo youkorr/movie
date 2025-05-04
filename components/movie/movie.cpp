@@ -13,9 +13,7 @@ namespace movie {
 
 MoviePlayer::MoviePlayer() {
   this->mutex_ = xSemaphoreCreateMutex();
-  this->playing_ = false;
-  this->threshold_ = 128;
-  this->scaling_mode_ = SCALE_CENTER;
+  this->scaling_mode_ = SCALE_FIT;  // Changed from SCALE_CENTER to SCALE_FIT
 }
 
 MoviePlayer::~MoviePlayer() {
@@ -35,6 +33,18 @@ void MoviePlayer::setup() {
     ESP_LOGE(TAG, "No display configured!");
     this->mark_failed();
   }
+}
+
+void MoviePlayer::dump_config() {
+  ESP_LOGCONFIG(TAG, "Movie Player:");
+  ESP_LOGCONFIG(TAG, "  Width: %d", this->width_);
+  ESP_LOGCONFIG(TAG, "  Height: %d", this->height_);
+  ESP_LOGCONFIG(TAG, "  Buffer Size: %u bytes", this->buffer_size_);
+  ESP_LOGCONFIG(TAG, "  Target FPS: %d", this->fps_);
+  ESP_LOGCONFIG(TAG, "  HTTP Timeout: %d ms", this->http_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  Default Format: %d", this->default_format_);
+  ESP_LOGCONFIG(TAG, "  Threshold: %d", this->threshold_);
+  ESP_LOGCONFIG(TAG, "  Scaling Mode: %d", this->scaling_mode_);
 }
 
 void MoviePlayer::loop() {
@@ -134,7 +144,10 @@ void MoviePlayer::stop() {
     this->ffmpeg_ctx_ = nullptr;
   }
 
-  this->ffmpeg_task_ = nullptr;
+  if (this->ffmpeg_task_ != nullptr) {
+    // FFmpeg lib stops internally and deletes task
+    this->ffmpeg_task_ = nullptr;
+  }
 
   ESP_LOGI(TAG, "Playback stopped.");
 }
@@ -148,12 +161,13 @@ void MoviePlayer::ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_da
 
 bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
   if (!this->display_ || !data) return false;
+
   if (xSemaphoreTake(this->mutex_, portMAX_DELAY) != pdTRUE) return false;
 
-  const uint16_t *rgb565_data = reinterpret_cast<const uint16_t *>(data);
+  const uint16_t *rgb_data = reinterpret_cast<const uint16_t *>(data);
   this->display_->fill(COLOR_OFF);
 
-  float scale_x = 1.0f, scale_y = 1.0f;
+  float scale_x = 1.0, scale_y = 1.0;
   int pos_x = 0, pos_y = 0;
 
   switch (this->scaling_mode_) {
@@ -161,34 +175,37 @@ bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
       scale_x = (float)this->width_ / width;
       scale_y = (float)this->height_ / height;
       break;
-    case SCALE_FIT: {
-      float scale = std::min((float)this->width_ / width, (float)this->height_ / height);
-      scale_x = scale_y = scale;
-      pos_x = (this->width_ - width * scale) / 2;
-      pos_y = (this->height_ - height * scale) / 2;
+      
+    case SCALE_FIT:
+      scale_x = scale_y = std::min((float)this->width_ / width, (float)this->height_ / height);
+      pos_x = (this->width_ - width * scale_x) / 2;
+      pos_y = (this->height_ - height * scale_y) / 2;
       break;
-    }
-    case SCALE_CENTER:
+      
+    case SCALE_NONE:
     default:
+      // Center the image without scaling
       pos_x = (this->width_ - width) / 2;
       pos_y = (this->height_ - height) / 2;
       break;
   }
 
-  for (int y = 0; y < height; y++) {
-    int ty = pos_y + (int)(y * scale_y);
-    if (ty < 0 || ty >= this->height_) continue;
-    for (int x = 0; x < width; x++) {
-      int tx = pos_x + (int)(x * scale_x);
-      if (tx < 0 || tx >= this->width_) continue;
+  int threshold = this->threshold_;
 
-      uint16_t pixel = rgb565_data[y * width + x];
-      uint8_t r = ((pixel >> 11) & 0x1F) * 255 / 31;
-      uint8_t g = ((pixel >> 5) & 0x3F) * 255 / 63;
-      uint8_t b = (pixel & 0x1F) * 255 / 31;
+  for (int y = 0; y < height; y++) {
+    int ty = pos_y + y * scale_y;
+    if (ty >= this->height_ || ty < 0) continue;
+    for (int x = 0; x < width; x++) {
+      int tx = pos_x + x * scale_x;
+      if (tx >= this->width_ || tx < 0) continue;
+
+      uint16_t pixel = rgb_data[y * width + x];
+      uint8_t r = ((pixel >> 11) & 0x1F) << 3;
+      uint8_t g = ((pixel >> 5) & 0x3F) << 2;
+      uint8_t b = (pixel & 0x1F) << 3;
       uint8_t lum = (r * 3 + g * 6 + b) / 10;
 
-      this->display_->draw_pixel_at(tx, ty, lum > this->threshold_ ? COLOR_ON : COLOR_OFF);
+      this->display_->draw_pixel_at(tx, ty, (lum > threshold) ? COLOR_ON : COLOR_OFF);
     }
   }
 

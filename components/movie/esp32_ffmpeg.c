@@ -9,9 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libswscale/swscale.h>
+
 
 static const char *TAG = "esp32_ffmpeg";
 

@@ -1,4 +1,9 @@
 #include "esp32_ffmpeg.h"
+#include "esphome/core/log.h"
+#include "esphome/core/hal.h"
+
+#ifdef USE_ESP32
+
 #include <string.h>
 #include <stdlib.h>
 #include <sys/unistd.h>
@@ -414,34 +419,44 @@ static bool read_file_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
 
 // Lecture d'une frame MJPEG depuis HTTP
 static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
-                                   size_t buffer_size, size_t *bytes_read) {
+                             size_t buffer_size, size_t *bytes_read) {
     esp_err_t err;
-
+    
+    // Si c'est la première requête ou si on a besoin de réinitialiser
     if (ctx->http_client == NULL) {
-        size_t http_buffer_size = buffer_size > 4096 ? 4096 : buffer_size;
-
+        // Réduire la taille du buffer HTTP pour éviter les problèmes d'allocation
+        size_t http_buffer_size = buffer_size > 8192 ? 8192 : buffer_size;
+        
         esp_http_client_config_t config = {
             .url = ctx->source_url,
-            .timeout_ms = 3000,
+            .timeout_ms = 5000,
             .buffer_size = http_buffer_size,
             .disable_auto_redirect = false,
         };
-
+        
+        // Essayer d'allouer avec une taille plus petite en cas d'échec
         ctx->http_client = esp_http_client_init(&config);
         if (ctx->http_client == NULL) {
             ESP_LOGE(TAG, "Failed to initialize HTTP client with buffer size %d", http_buffer_size);
-            return false;
+            
+            // Réessayer avec un buffer plus petit
+            config.buffer_size = 4096;  // Taille minimale
+            ctx->http_client = esp_http_client_init(&config);
+            
+            if (ctx->http_client == NULL) {
+                ESP_LOGE(TAG, "Failed to initialize HTTP client even with reduced buffer");
+                return false;
+            }
+            ESP_LOGI(TAG, "HTTP client initialized with reduced buffer size");
         }
-        ESP_LOGI(TAG, "HTTP client initialized");
     }
-
+    
+    // Ouvrir la connexion avec méthode GET explicite
     err = esp_http_client_set_method(ctx->http_client, HTTP_METHOD_GET);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set HTTP method: %s", esp_err_to_name(err));
-        return false;
     }
-
-    ESP_LOGI(TAG, "Opening HTTP connection...");
+    
     err = esp_http_client_open(ctx->http_client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
@@ -449,86 +464,97 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
         ctx->http_client = NULL;
         return false;
     }
-
+    
+    // Récupérer les headers
     int content_length = esp_http_client_fetch_headers(ctx->http_client);
     if (content_length < 0) {
-        ESP_LOGE(TAG, "Failed to fetch headers");
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
         esp_http_client_close(ctx->http_client);
         return false;
     }
-
-    // Récupération du Content-Type
-    char *content_type_value = NULL;
-    if (esp_http_client_get_header(ctx->http_client, "Content-Type", &content_type_value) == ESP_OK && content_type_value != NULL) {
-        ESP_LOGI(TAG, "Content-Type: %s, Length: %d", content_type_value, content_length);
-        bool is_mp4 = strstr(content_type_value, "mp4") != NULL || strstr(content_type_value, "video/mp4") != NULL;
-        bool is_avi = strstr(content_type_value, "avi") != NULL || strstr(content_type_value, "video/avi") != NULL;
-
+    
+    // Extraire le type de contenu pour détecter le format
+    char content_type[64] = {0};
+    if (esp_http_client_get_header(ctx->http_client, "Content-Type", content_type, sizeof(content_type)) > 0) {
+        ESP_LOGI(TAG, "Content type: %s, length: %d", content_type, content_length);
+        
+        // Détection des types de fichiers vidéo
+        bool is_mp4 = (strstr(content_type, "mp4") != NULL || strstr(content_type, "video/mp4") != NULL);
+        bool is_avi = (strstr(content_type, "avi") != NULL || strstr(content_type, "video/avi") != NULL);
+        
         if (is_mp4) {
-            ESP_LOGW(TAG, "MP4 format detected - trying to extract JPEG frames");
+            ESP_LOGW(TAG, "MP4 format detected - not directly supported, attempting to extract JPEG frames");
             ctx->is_mp4 = true;
         } else if (is_avi) {
-            ESP_LOGI(TAG, "AVI format detected");
+            ESP_LOGI(TAG, "AVI format detected via HTTP");
             ctx->is_avi = true;
         }
     }
-
-    int to_read = (content_length > 0 && content_length < buffer_size) ? content_length : buffer_size;
+    
+    // Limiter la lecture au buffer_size
+    int to_read = content_length > 0 && content_length < buffer_size ? 
+                  content_length : buffer_size;
+    
+    // Lire le corps avec gestion des échecs
     int total_read = 0;
     int remaining = to_read;
     int retry_count = 0;
     const int max_retries = 3;
-
+    
     while (remaining > 0 && retry_count < max_retries) {
-        int read_len = esp_http_client_read(ctx->http_client, (char *)buffer + total_read, remaining);
+        int read_len = esp_http_client_read(ctx->http_client, 
+                                          (char*)buffer + total_read, 
+                                          remaining);
         if (read_len <= 0) {
-            ESP_LOGW(TAG, "HTTP read failed (%d), retry %d/%d", read_len, retry_count + 1, max_retries);
+            ESP_LOGW(TAG, "HTTP read returned %d, retry %d/%d", 
+                   read_len, retry_count + 1, max_retries);
             retry_count++;
-            vTaskDelay(pdMS_TO_TICKS(100));  // évite le blocage watchdog
+            vTaskDelay(pdMS_TO_TICKS(100));  // Petit délai avant nouvelle tentative
             continue;
         }
+        
         total_read += read_len;
         remaining -= read_len;
-        vTaskDelay(pdMS_TO_TICKS(1));  // yield léger
     }
-
+    
     esp_http_client_close(ctx->http_client);
-
+    
     if (total_read <= 0) {
-        ESP_LOGE(TAG, "Failed to read HTTP content after %d retries", retry_count);
+        ESP_LOGE(TAG, "HTTP client read failed after %d retries", retry_count);
         return false;
     }
-
+    
     *bytes_read = total_read;
-
-    // Détection de frame JPEG dans MP4
+    
+    // Pour MP4: traitement spécial pour extraire les keyframes JPEG si possible
     if (ctx->is_mp4) {
         int marker_pos = find_jpeg_marker(buffer, total_read);
         if (marker_pos >= 0) {
-            ESP_LOGI(TAG, "JPEG marker found in MP4 data at pos %d", marker_pos);
+            ESP_LOGI(TAG, "Found JPEG marker in MP4 data at position %d", marker_pos);
             memmove(buffer, buffer + marker_pos, total_read - marker_pos);
             *bytes_read = total_read - marker_pos;
         } else {
-            ESP_LOGW(TAG, "No JPEG marker found in MP4 block");
+            ESP_LOGW(TAG, "No JPEG marker found in MP4 data, continuing anyway");
+            // On continue quand même, peut-être qu'on aura plus de chance avec les frames suivantes
         }
     }
-    // Vérification JPEG si pas AVI
+    // Pour d'autres formats (MJPEG ou inconnus): vérifier pour JPEG
     else if (!ctx->is_avi && (buffer[0] != 0xFF || buffer[1] != 0xD8)) {
-        ESP_LOGW(TAG, "Data does not start with JPEG marker, searching...");
+        ESP_LOGW(TAG, "Data doesn't start with JPEG marker, looking for marker");
         int marker_pos = find_jpeg_marker(buffer, total_read);
+        
         if (marker_pos >= 0) {
-            ESP_LOGI(TAG, "JPEG marker found at pos %d", marker_pos);
+            ESP_LOGI(TAG, "Found JPEG marker at position %d", marker_pos);
             memmove(buffer, buffer + marker_pos, total_read - marker_pos);
             *bytes_read = total_read - marker_pos;
         } else {
-            ESP_LOGW(TAG, "No JPEG marker found in received data");
+            ESP_LOGW(TAG, "No JPEG marker found in data");
+            // On continue malgré tout - peut-être pas une frame JPEG
         }
     }
-
+    
     return true;
 }
-
-
 
 // Lecture d'une frame MJPEG (wrapper)
 static bool read_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer,
@@ -852,4 +878,8 @@ esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int heig
     return ESP_OK;
 }
 
+} // namespace esp32_ffmpeg
+} // namespace esphome
+
+#endif // USE_ESP32
 

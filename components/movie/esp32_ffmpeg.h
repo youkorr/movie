@@ -1,22 +1,28 @@
 #pragma once
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <esp_err.h>
+#include "esphome/core/component.h"
+#include "esphome/core/automation.h"
+#include "esphome/components/display/display_buffer.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#ifdef USE_ESP32
 
+#include <string>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_http_client.h>
+
+namespace esphome {
+namespace esp32_ffmpeg {
+
+// Types repris de l'original
 typedef struct {
     uint8_t *data;
-    int size;
+    size_t size;
     int width;
     int height;
     int64_t pts;
 } esp_ffmpeg_frame_t;
-
-typedef struct esp_ffmpeg_context_s esp_ffmpeg_context_t;
 
 typedef enum {
     ESP_FFMPEG_SOURCE_TYPE_FILE,
@@ -25,50 +31,68 @@ typedef enum {
 
 typedef void (*esp_ffmpeg_frame_callback_t)(esp_ffmpeg_frame_t *frame, void *user_data);
 
-/**
- * @brief Initialize the FFmpeg context
- * 
- * @param source_url File path or HTTP URL
- * @param source_type Type of source (file or HTTP)
- * @param frame_callback Callback function to receive decoded frames
- * @param user_data User data to pass to callback
- * @param ctx Pointer to receive the created context
- * @return esp_err_t 
- */
-esp_err_t esp_ffmpeg_init(const char *source_url, 
-                         esp_ffmpeg_source_type_t source_type,
-                         esp_ffmpeg_frame_callback_t frame_callback,
-                         void *user_data,
-                         esp_ffmpeg_context_t **ctx);
+struct esp_ffmpeg_context_s;
+typedef struct esp_ffmpeg_context_s esp_ffmpeg_context_t;
 
-/**
- * @brief Start decoding frames in a separate task
- * 
- * @param ctx FFmpeg context
- * @return esp_err_t 
- */
-esp_err_t esp_ffmpeg_start(esp_ffmpeg_context_t *ctx);
+// Classe principale du composant ESPHome
+class ESP32FFmpegComponent : public esphome::Component {
+public:
+    ESP32FFmpegComponent();
+    ~ESP32FFmpegComponent();
 
-/**
- * @brief Stop decoding and free resources
- * 
- * @param ctx FFmpeg context
- * @return esp_err_t 
- */
-esp_err_t esp_ffmpeg_stop(esp_ffmpeg_context_t *ctx);
+    // Setters pour la configuration
+    void set_source_url(const std::string &url) { source_url_ = url; }
+    void set_source_type(const std::string &type) {
+        if (type == "http") {
+            source_type_ = ESP_FFMPEG_SOURCE_TYPE_HTTP;
+        } else {
+            source_type_ = ESP_FFMPEG_SOURCE_TYPE_FILE;
+        }
+    }
+    void set_width(int width) { width_ = width; }
+    void set_height(int height) { height_ = height; }
+    
+    // Méthodes ESPHome
+    void setup() override;
+    void loop() override;
+    void dump_config() override;
+    
+    float get_setup_priority() const override { return setup_priority::LATE; }
+    
+    // Accès au dernier frame
+    uint16_t *get_current_frame() { return current_frame_; }
+    int get_width() const { return width_; }
+    int get_height() const { return height_; }
+    bool has_new_frame() const { return has_new_frame_; }
+    void frame_consumed() { has_new_frame_ = false; }
+    
+    // Pour les triggers/actions
+    void set_on_frame_callback(std::function<void()> callback) { frame_callback_ = std::move(callback); }
+    
+protected:
+    static void frame_callback_static(esp_ffmpeg_frame_t *frame, void *user_data);
+    void on_frame(esp_ffmpeg_frame_t *frame);
+    
+    std::string source_url_;
+    esp_ffmpeg_source_type_t source_type_{ESP_FFMPEG_SOURCE_TYPE_HTTP};
+    int width_{128};
+    int height_{64};
+    
+    esp_ffmpeg_context_t *ctx_{nullptr};
+    uint16_t *current_frame_{nullptr};
+    bool has_new_frame_{false};
+    std::function<void()> frame_callback_{};
+};
 
-/**
- * @brief Convert RGB565 frame to different format
- * 
- * @param src Source RGB565 data
- * @param dst Destination buffer
- * @param width Frame width
- * @param height Frame height 
- * @param dst_format Destination format (0=RGB565, 1=RGB888, 2=GRAYSCALE)
- * @return esp_err_t 
- */
-esp_err_t esp_ffmpeg_convert_frame(uint16_t *src, void *dst, int width, int height, int dst_format);
+// Trigger quand un nouveau frame est disponible
+class NewFrameTrigger : public Trigger<> {
+public:
+    explicit NewFrameTrigger(ESP32FFmpegComponent *parent) {
+        parent->set_on_frame_callback([this]() { this->trigger(); });
+    }
+};
 
-#ifdef __cplusplus
-}
-#endif
+} // namespace esp32_ffmpeg
+} // namespace esphome
+
+#endif // USE_ESP32

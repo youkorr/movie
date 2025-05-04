@@ -10,9 +10,6 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 
-#include "mp4dec.h"           // Pour MP4
-#include "h264dec.h"          // Pour H.264
-
 static const char *TAG = "esp32_ffmpeg";
 
 // Structures pour le format AVI
@@ -45,32 +42,45 @@ struct esp_ffmpeg_context_s {
     TaskHandle_t task_handle;
     SemaphoreHandle_t mutex;
 
+    // Pour les fichiers
     FILE *input_file;
+
+    // Pour HTTP
     esp_http_client_handle_t http_client;
 
+    // Buffer de décodage
     uint8_t *buffer;
     size_t buffer_size;
 
+    // Info vidéo
     int width;
     int height;
     int frame_count;
     bool is_mjpeg;
+
+    // Pour AVI
     bool is_avi;
-    bool is_mp4;
-    bool is_h264;
-
-    long avi_data_offset;
-    long avi_current_offset;
-    uint32_t avi_total_frames;
-
-    mp4dec_t mp4_decoder;
+    long avi_data_offset;     // Offset où commencent les données vidéo
+    long avi_current_offset;  // Offset courant de lecture
+    uint32_t avi_frame_size;  // Taille moyenne des frames
+    uint32_t avi_total_frames; // Nombre total de frames
 };
 
 // Décodage JPEG fictif (remplacer par tjpgd si besoin)
 static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
                         uint16_t *rgb565_buffer, int width, int height) {
     if (data_len < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
-        ESP_LOGE(TAG, "Not a valid JPEG marker.");
+        ESP_LOGE(TAG, "Not a valid JPEG marker. First bytes: 0x%02x 0x%02x", 
+                 data_len > 0 ? jpeg_data[0] : 0xFF, 
+                 data_len > 1 ? jpeg_data[1] : 0xFF);
+
+        if (data_len > 0) {
+            ESP_LOGI(TAG, "First bytes of data:");
+            for (int i = 0; i < (data_len < 16 ? data_len : 16); i++) {
+                ESP_LOGI(TAG, "Byte %d: 0x%02x (%c)", i, jpeg_data[i], 
+                         (jpeg_data[i] >= 32 && jpeg_data[i] <= 126) ? jpeg_data[i] : '.');
+            }
+        }
         return false;
     }
 
@@ -266,6 +276,7 @@ static bool read_file_avi_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, size
         ctx->avi_current_offset = ftell(ctx->input_file);
         if (chunk_size % 2 == 1) {
             fseek(ctx->input_file, 1, SEEK_CUR);
+            ctx->avi_current_offset = ftell(ctx->input_file);
         }
         return true;
     } else {
@@ -390,42 +401,6 @@ static bool read_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, size_t 
     return false;
 }
 
-// Initialiser le décodeur MP4
-static bool init_mp4_decoder(esp_ffmpeg_context_t *ctx) {
-    if (mp4dec_init(&ctx->mp4_decoder, ctx->input_file) != 0) {
-        ESP_LOGE(TAG, "Failed to initialize MP4 decoder");
-        return false;
-    }
-
-    mp4_video_info_t video_info;
-    if (mp4dec_get_video_info(&ctx->mp4_decoder, &video_info) != 0) {
-        ESP_LOGE(TAG, "Failed to get video info from MP4");
-        return false;
-    }
-
-    ctx->width = video_info.width;
-    ctx->height = video_info.height;
-    ctx->is_h264 = (video_info.codec == MP4_VIDEO_CODEC_H264);
-
-    ESP_LOGI(TAG, "MP4 video detected: %dx%d, Codec: %s", ctx->width, ctx->height, ctx->is_h264 ? "H.264" : "Unknown");
-    return true;
-}
-
-// Lire une trame MP4
-static bool read_mp4_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, size_t buffer_size, size_t *bytes_read) {
-    if (!ctx->is_h264) {
-        ESP_LOGE(TAG, "Only H.264 decoding supported in MP4");
-        return false;
-    }
-
-    if (h264dec_read_frame(&ctx->mp4_decoder, buffer, buffer_size, bytes_read) != 0) {
-        ESP_LOGE(TAG, "Failed to read H.264 frame from MP4");
-        return false;
-    }
-
-    return true;
-}
-
 // Tâche de décodage
 static void ffmpeg_decode_task(void *arg) {
     esp_ffmpeg_context_t *ctx = (esp_ffmpeg_context_t *)arg;
@@ -475,14 +450,7 @@ static void ffmpeg_decode_task(void *arg) {
         }
 
         size_t bytes_read = 0;
-        bool read_success = false;
-
-        if (ctx->is_mp4) {
-            read_success = read_mp4_frame(ctx, ctx->buffer, ctx->buffer_size, &bytes_read);
-        } else {
-            read_success = read_mjpeg_frame(ctx, ctx->buffer, ctx->buffer_size, &bytes_read);
-        }
-
+        bool read_success = read_mjpeg_frame(ctx, ctx->buffer, ctx->buffer_size, &bytes_read);
         if (!read_success) {
             ESP_LOGW(TAG, "Failed to read frame, consecutive errors: %d", ++consecutive_errors);
             if (consecutive_errors >= max_consecutive_errors) {
@@ -496,18 +464,10 @@ static void ffmpeg_decode_task(void *arg) {
         consecutive_errors = 0;
         ESP_LOGD(TAG, "Read %d bytes of video data", bytes_read);
 
-        if (ctx->is_mp4) {
-            if (!h264dec_decode_frame(&ctx->mp4_decoder, ctx->buffer, bytes_read, (void**)(&rgb565_buffer), &frame.size)) {
-                ESP_LOGE(TAG, "Failed to decode H.264 frame");
-                vTaskDelay(delay_time);
-                continue;
-            }
-        } else {
-            if (!decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
-                ESP_LOGE(TAG, "Failed to decode JPEG frame");
-                vTaskDelay(delay_time);
-                continue;
-            }
+        if (!decode_jpeg(ctx->buffer, bytes_read, rgb565_buffer, ctx->width, ctx->height)) {
+            ESP_LOGE(TAG, "Failed to decode JPEG frame");
+            vTaskDelay(delay_time);
+            continue;
         }
 
         frame.pts++;
@@ -543,10 +503,9 @@ esp_err_t esp_ffmpeg_init(const char *source_url, esp_ffmpeg_source_type_t sourc
     new_ctx->frame_count = 0;
     new_ctx->is_mjpeg = true;
     new_ctx->is_avi = false;
-    new_ctx->is_mp4 = false;
-    new_ctx->is_h264 = false;
     new_ctx->avi_data_offset = 0;
     new_ctx->avi_current_offset = 0;
+    new_ctx->avi_frame_size = 0;
     new_ctx->avi_total_frames = 0;
     new_ctx->http_client = NULL;
     new_ctx->input_file = NULL;
@@ -585,12 +544,8 @@ esp_err_t esp_ffmpeg_init(const char *source_url, esp_ffmpeg_source_type_t sourc
         fseek(new_ctx->input_file, 0, SEEK_SET);
 
         if (read_bytes >= 12 && strncmp(file_header, "RIFF", 4) == 0 && strncmp(file_header + 8, "AVI ", 4) == 0) {
+            ESP_LOGI(TAG, "File is in AVI format");
             new_ctx->is_avi = true;
-        } else if (read_bytes >= 4 && strncmp(file_header, "ftyp", 4) == 0) {
-            new_ctx->is_mp4 = true;
-            if (!init_mp4_decoder(new_ctx)) {
-                ESP_LOGE(TAG, "Failed to initialize MP4 decoder");
-            }
         }
     }
 

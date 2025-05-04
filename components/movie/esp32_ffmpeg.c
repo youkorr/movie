@@ -64,6 +64,10 @@ struct esp_ffmpeg_context_s {
     long avi_current_offset;  // Offset courant de lecture
     uint32_t avi_frame_size;  // Taille moyenne des frames
     uint32_t avi_total_frames; // Nombre total de frames
+    
+    // Paramètres de récupération HTTP
+    int reconnect_attempts;
+    int reconnect_delay;
 };
 
 // Décodage JPEG fictif (remplacer par tjpgd si besoin)
@@ -84,6 +88,7 @@ static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
         return false;
     }
 
+    // Décodage simple pour ce démonstrateur - à remplacer par un vrai décodeur JPEG
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int offset = ((y * width + x) * 3) % (data_len - 10);
@@ -100,14 +105,62 @@ static bool decode_jpeg(uint8_t *jpeg_data, size_t data_len,
     return true;
 }
 
-// Recherche du marqueur JPEG dans un buffer
+// Recherche améliorée du marqueur JPEG dans un buffer
 static int find_jpeg_marker(uint8_t *buffer, size_t buffer_size) {
-    for (size_t i = 0; i < buffer_size - 1; i++) {
-        if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
+    // Recherche la séquence de début d'image JPEG (0xFF 0xD8)
+    for (size_t i = 0; i < buffer_size - 4; i++) {
+        if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8 && buffer[i + 2] == 0xFF) {
+            // Valider le marqueur JPEG - généralement suivi par 0xE0 (JFIF), 0xE1 (Exif) ou autres segments
+            if ((buffer[i + 3] >= 0xE0 && buffer[i + 3] <= 0xEF) || 
+                buffer[i + 3] == 0xDB || // Définition de table de quantification
+                buffer[i + 3] == 0xC0 || // Début de frame
+                buffer[i + 3] == 0xC4) { // Table de Huffman
+                
+                ESP_LOGI(TAG, "Found valid JPEG marker at position %d with segment marker 0x%02X", 
+                         i, buffer[i + 3]);
+                return i;
+            }
+            
+            // Si on trouve simplement SOI mais pas de segment valide, on le considère quand même
+            // mais avec un log de warning
+            ESP_LOGW(TAG, "Found SOI marker at position %d but no valid segment marker", i);
             return i;
         }
     }
+    
+    // Cas particulier: si on trouve juste FF D8 à la fin du buffer
+    if (buffer_size >= 2 && 
+        buffer[buffer_size - 2] == 0xFF && 
+        buffer[buffer_size - 1] == 0xD8) {
+        ESP_LOGW(TAG, "Found partial JPEG marker at end of buffer");
+        return buffer_size - 2;
+    }
+    
     return -1;
+}
+
+// Analyser l'en-tête HTTP pour détecter le type de contenu
+static bool parse_http_content_type(esp_http_client_handle_t client) {
+    const char* content_type = esp_http_client_get_header(client, "Content-Type");
+    if (content_type) {
+        ESP_LOGI(TAG, "Content-Type: %s", content_type);
+        
+        // Vérifier les types de contenu pertinents
+        if (strstr(content_type, "video/x-msvideo") || 
+            strstr(content_type, "video/avi")) {
+            ESP_LOGI(TAG, "AVI content detected");
+            return true;
+        }
+        else if (strstr(content_type, "image/jpeg") || 
+                 strstr(content_type, "multipart/x-mixed-replace")) {
+            ESP_LOGI(TAG, "JPEG or MJPEG stream detected");
+            return true;
+        }
+    } else {
+        ESP_LOGW(TAG, "No Content-Type header found");
+    }
+    
+    return false;
 }
 
 // Parser l'en-tête AVI
@@ -177,7 +230,7 @@ static bool parse_avi_header(esp_ffmpeg_context_t *ctx) {
                         char format_str[5] = {0};
                         memcpy(format_str, &stream_format, 4);
                         ESP_LOGI(TAG, "Video format: %.4s, Width: %d, Height: %d", format_str, ctx->width, ctx->height);
-                        ctx->is_mjpeg = (stream_format == 0x47504A4D);
+                        ctx->is_mjpeg = (stream_format == 0x47504A4D); // "MJPG"
                         found_header = true;
                         fseek(ctx->input_file, subchunk_size - sizeof(avi_bitmap_info_header_t), SEEK_CUR);
                     } else {
@@ -251,8 +304,20 @@ static bool read_file_avi_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, size
         return false;
     }
 
-    if (chunk_id[0] == '0' && chunk_id[1] == '0' && (chunk_id[2] == 'd' || chunk_id[2] == 'w') && (chunk_id[3] == 'c' || chunk_id[3] == 'b')) {
+    // Détection plus robuste des chunks vidéo
+    if ((chunk_id[0] == '0' && chunk_id[1] == '0' && 
+         (chunk_id[2] == 'd' || chunk_id[2] == 'w') && 
+         (chunk_id[3] == 'c' || chunk_id[3] == 'b')) ||
+        (strncmp(chunk_id, "00dc", 4) == 0) ||  // Common video chunk markers
+        (strncmp(chunk_id, "00db", 4) == 0)) {  // Uncompressed video frames
+        
         ESP_LOGD(TAG, "Video chunk: %.4s, Size: %d", chunk_id, chunk_size);
+
+        // Vérifier que la taille du chunk est raisonnable
+        if (chunk_size > 10000000) {  // Limite arbitraire de 10MB
+            ESP_LOGW(TAG, "Unusually large chunk size: %d, limiting to buffer size", chunk_size);
+            chunk_size = buffer_size;
+        }
 
         size_t to_read = chunk_size > buffer_size ? buffer_size : chunk_size;
         *bytes_read = fread(buffer, 1, to_read, ctx->input_file);
@@ -328,12 +393,18 @@ static bool read_file_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, si
 static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, size_t buffer_size, size_t *bytes_read) {
     esp_err_t err;
 
+    // Vérifier si le client HTTP doit être (ré)initialisé
     if (ctx->http_client == NULL) {
+        ESP_LOGI(TAG, "Initializing HTTP client for URL: %s", ctx->source_url);
+        
         esp_http_client_config_t config = {
             .url = ctx->source_url,
-            .timeout_ms = 5000,
+            .timeout_ms = 10000,  // Timeout plus long
             .buffer_size = buffer_size,
+            .skip_cert_common_name_check = true,  // Ignorer la vérification du nom commun pour les certificats
+            .is_async = false
         };
+        
         ctx->http_client = esp_http_client_init(&config);
         if (ctx->http_client == NULL) {
             ESP_LOGE(TAG, "Failed to initialize HTTP client");
@@ -341,21 +412,42 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, si
         }
     }
 
+    // Ouvrir la connexion
     err = esp_http_client_open(ctx->http_client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(ctx->http_client);
-        ctx->http_client = NULL;
-        return false;
+        
+        // Tentative de récupération
+        if (ctx->reconnect_attempts < 5) {
+            ESP_LOGI(TAG, "Attempting to reconnect (attempt %d)", ++ctx->reconnect_attempts);
+            esp_http_client_cleanup(ctx->http_client);
+            ctx->http_client = NULL;
+            vTaskDelay(pdMS_TO_TICKS(ctx->reconnect_delay));
+            ctx->reconnect_delay *= 2;  // Backoff exponentiel
+            return false;
+        } else {
+            ESP_LOGE(TAG, "Max reconnect attempts reached");
+            return false;
+        }
     }
+    
+    // Réinitialiser le compteur d'essais si connexion réussie
+    ctx->reconnect_attempts = 0;
+    ctx->reconnect_delay = 500;  // Réinitialiser le délai
 
+    // Récupérer les en-têtes et vérifier le type de contenu
     int content_length = esp_http_client_fetch_headers(ctx->http_client);
+    parse_http_content_type(ctx->http_client);
+    
     if (content_length < 0) {
         ESP_LOGE(TAG, "HTTP client fetch headers failed");
         esp_http_client_close(ctx->http_client);
         return false;
     }
 
+    ESP_LOGI(TAG, "Content length: %d", content_length);
+    
+    // Limiter la lecture si content_length est énorme ou non défini
     int to_read = content_length > 0 && content_length < buffer_size ? content_length : buffer_size;
     int total_read = 0;
     int remaining = to_read;
@@ -373,8 +465,16 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, si
         return false;
     }
 
+    // Afficher les premiers octets pour le débogage
+    ESP_LOGI(TAG, "First bytes of HTTP response:");
+    for (int i = 0; i < (total_read < 32 ? total_read : 32); i++) {
+        ESP_LOGI(TAG, "Byte %d: 0x%02x (%c)", i, buffer[i], 
+                 (buffer[i] >= 32 && buffer[i] <= 126) ? buffer[i] : '.');
+    }
+
     *bytes_read = total_read;
 
+    // Vérifier si nous avons un marqueur JPEG valide
     if (buffer[0] != 0xFF || buffer[1] != 0xD8) {
         ESP_LOGW(TAG, "HTTP data doesn't start with JPEG marker, looking for marker");
         int marker_pos = find_jpeg_marker(buffer, total_read);
@@ -383,8 +483,19 @@ static bool read_http_mjpeg_frame(esp_ffmpeg_context_t *ctx, uint8_t *buffer, si
             memmove(buffer, buffer + marker_pos, total_read - marker_pos);
             *bytes_read = total_read - marker_pos;
         } else {
-            ESP_LOGE(TAG, "No JPEG marker found in HTTP data");
-            return false;
+            // Recherche d'une signature AVI
+            if (total_read >= 12 && 
+                strncmp((char*)buffer, "RIFF", 4) == 0 && 
+                strncmp((char*)buffer + 8, "AVI ", 4) == 0) {
+                
+                ESP_LOGI(TAG, "Detected AVI file in HTTP response");
+                // Traitement spécial pour les AVI téléchargés
+                // Ici, vous pourriez implémenter un gestionnaire temporaire de fichier
+                // ou adapter votre code pour gérer un AVI en mémoire
+            } else {
+                ESP_LOGE(TAG, "No JPEG or AVI marker found in HTTP data");
+                return false;
+            }
         }
     }
 

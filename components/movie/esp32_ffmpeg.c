@@ -141,23 +141,25 @@ static int find_jpeg_marker(uint8_t *buffer, size_t buffer_size) {
 
 // Analyser l'en-tête HTTP pour détecter le type de contenu
 static bool parse_http_content_type(esp_http_client_handle_t client) {
-    const char* content_type = esp_http_client_get_header(client, "Content-Type");
-    if (content_type) {
-        ESP_LOGI(TAG, "Content-Type: %s", content_type);
+    char *content_type_value = NULL;
+    esp_err_t err = esp_http_client_get_header(client, "Content-Type", &content_type_value);
+    
+    if (err == ESP_OK && content_type_value != NULL) {
+        ESP_LOGI(TAG, "Content-Type: %s", content_type_value);
         
         // Vérifier les types de contenu pertinents
-        if (strstr(content_type, "video/x-msvideo") || 
-            strstr(content_type, "video/avi")) {
+        if (strstr(content_type_value, "video/x-msvideo") || 
+            strstr(content_type_value, "video/avi")) {
             ESP_LOGI(TAG, "AVI content detected");
             return true;
         }
-        else if (strstr(content_type, "image/jpeg") || 
-                 strstr(content_type, "multipart/x-mixed-replace")) {
+        else if (strstr(content_type_value, "image/jpeg") || 
+                 strstr(content_type_value, "multipart/x-mixed-replace")) {
             ESP_LOGI(TAG, "JPEG or MJPEG stream detected");
             return true;
         }
     } else {
-        ESP_LOGW(TAG, "No Content-Type header found");
+        ESP_LOGW(TAG, "No Content-Type header found or error retrieving it");
     }
     
     return false;

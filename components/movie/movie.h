@@ -71,6 +71,8 @@ class MoviePlayer : public Component {
   uint32_t avg_fps_{0};
   
   SemaphoreHandle_t mutex_{nullptr};
+
+  TaskHandle_t ffmpeg_task_{nullptr};
   
   // Nouveaux membres
   uint8_t threshold_{128};  // Valeur par défaut pour la conversion monochrome

@@ -13,6 +13,9 @@ namespace movie {
 
 MoviePlayer::MoviePlayer() {
   this->mutex_ = xSemaphoreCreateMutex();
+  this->playing_ = false;
+  this->threshold_ = 128;
+  this->scaling_mode_ = SCALE_CENTER;
 }
 
 MoviePlayer::~MoviePlayer() {
@@ -131,10 +134,7 @@ void MoviePlayer::stop() {
     this->ffmpeg_ctx_ = nullptr;
   }
 
-  if (this->ffmpeg_task_ != nullptr) {
-    // FFmpeg lib stops internally and deletes task
-    this->ffmpeg_task_ = nullptr;
-  }
+  this->ffmpeg_task_ = nullptr;
 
   ESP_LOGI(TAG, "Playback stopped.");
 }
@@ -148,44 +148,47 @@ void MoviePlayer::ffmpeg_frame_callback(esp_ffmpeg_frame_t *frame, void *user_da
 
 bool MoviePlayer::display_frame(const uint8_t *data, int width, int height) {
   if (!this->display_ || !data) return false;
-
   if (xSemaphoreTake(this->mutex_, portMAX_DELAY) != pdTRUE) return false;
 
-  const uint16_t *rgb_data = reinterpret_cast<const uint16_t *>(data);
+  const uint16_t *rgb565_data = reinterpret_cast<const uint16_t *>(data);
   this->display_->fill(COLOR_OFF);
 
-  float scale_x = 1.0, scale_y = 1.0;
+  float scale_x = 1.0f, scale_y = 1.0f;
   int pos_x = 0, pos_y = 0;
 
-  if (this->scaling_mode_ == SCALE_FILL) {
-    scale_x = (float)this->width_ / width;
-    scale_y = (float)this->height_ / height;
-  } else if (this->scaling_mode_ == SCALE_FIT) {
-    float scale = std::min((float)this->width_ / width, (float)this->height_ / height);
-    scale_x = scale_y = scale;
-    pos_x = (this->width_ - width * scale) / 2;
-    pos_y = (this->height_ - height * scale) / 2;
-  } else {
-    pos_x = (this->width_ - width) / 2;
-    pos_y = (this->height_ - height) / 2;
+  switch (this->scaling_mode_) {
+    case SCALE_FILL:
+      scale_x = (float)this->width_ / width;
+      scale_y = (float)this->height_ / height;
+      break;
+    case SCALE_FIT: {
+      float scale = std::min((float)this->width_ / width, (float)this->height_ / height);
+      scale_x = scale_y = scale;
+      pos_x = (this->width_ - width * scale) / 2;
+      pos_y = (this->height_ - height * scale) / 2;
+      break;
+    }
+    case SCALE_CENTER:
+    default:
+      pos_x = (this->width_ - width) / 2;
+      pos_y = (this->height_ - height) / 2;
+      break;
   }
 
-  int threshold = this->threshold_;
-
   for (int y = 0; y < height; y++) {
-    int ty = pos_y + y * scale_y;
-    if (ty >= this->height_ || ty < 0) continue;
+    int ty = pos_y + (int)(y * scale_y);
+    if (ty < 0 || ty >= this->height_) continue;
     for (int x = 0; x < width; x++) {
-      int tx = pos_x + x * scale_x;
-      if (tx >= this->width_ || tx < 0) continue;
+      int tx = pos_x + (int)(x * scale_x);
+      if (tx < 0 || tx >= this->width_) continue;
 
-      uint16_t pixel = rgb_data[y * width + x];
-      uint8_t r = ((pixel >> 11) & 0x1F) << 3;
-      uint8_t g = ((pixel >> 5) & 0x3F) << 2;
-      uint8_t b = (pixel & 0x1F) << 3;
+      uint16_t pixel = rgb565_data[y * width + x];
+      uint8_t r = ((pixel >> 11) & 0x1F) * 255 / 31;
+      uint8_t g = ((pixel >> 5) & 0x3F) * 255 / 63;
+      uint8_t b = (pixel & 0x1F) * 255 / 31;
       uint8_t lum = (r * 3 + g * 6 + b) / 10;
 
-      this->display_->draw_pixel_at(tx, ty, (lum > threshold) ? COLOR_ON : COLOR_OFF);
+      this->display_->draw_pixel_at(tx, ty, lum > this->threshold_ ? COLOR_ON : COLOR_OFF);
     }
   }
 
@@ -204,6 +207,7 @@ void MoviePlayer::set_scaling_mode(ScalingMode mode) {
 
 }  // namespace movie
 }  // namespace esphome
+
 
 
 

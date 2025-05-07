@@ -1,11 +1,12 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_URL, CONF_FPS
-from esphome.components import display, esp32
+from esphome.const import CONF_ID, CONF_URL
+
+# Define our own constant since it's not in esphome.const
+CONF_FPS = "fps"
 
 DEPENDENCIES = ["esp32"]
 CODEOWNERS = ["@esphome/core"]
-
 video_camera_ns = cg.esphome_ns.namespace("video_camera")
 VideoCamera = video_camera_ns.class_("VideoCamera", cg.Component)
 

@@ -1,95 +1,176 @@
 #include "video_camera.h"
-#include "esp_log.h"
-#include "esp_jpg_decode.h"
+#include "esphome/core/log.h"
+#include "esphome/core/application.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "esp_http_client.h"
+#include "esp_camera.h"
+#include <algorithm>
+
+#ifdef USE_ESP32
+#include "esp_heap_caps.h"
+#endif
 
 namespace esphome {
 namespace video_camera {
 
 static const char *TAG = "video_camera";
 
+// Structure pour passer les données à la tâche RTSP
+struct RtspTaskData {
+  VideoCamera *camera;
+};
+
 void VideoCamera::setup() {
-  esp_http_client_config_t config = {
-    .url = this->url_.c_str(),
-    .method = HTTP_METHOD_GET,
-    .timeout_ms = 5000,
-  };
-  this->http_client_ = esp_http_client_init(&config);
-  if (esp_http_client_open(this->http_client_, 0) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to open HTTP connection");
-  } else {
-    ESP_LOGI(TAG, "Connected to MJPEG stream");
-  }
+  ESP_LOGCONFIG(TAG, "Setting up RTSP Video Camera...");
+  
+  // Initialiser le client RTSP dans un thread séparé
+  RtspTaskData *task_data = new RtspTaskData{this};
+  
+  xTaskCreatePinnedToCore(
+    VideoCamera::rtsp_task,
+    "rtsp_task",
+    8192,  // Stack size
+    task_data,
+    1,  // Priority
+    &rtsp_task_handle_,
+    0  // Core où exécuter la tâche (0)
+  );
+  
+  rtsp_running_ = true;
+  ESP_LOGI(TAG, "RTSP Video Camera setup complete");
 }
 
 void VideoCamera::loop() {
-  uint32_t now = millis();
-  if (now - last_update_ < update_interval_) return;
-  last_update_ = now;
+  // La tâche principale est gérée par le thread RTSP
+  // Cette boucle n'a pas grand-chose à faire car le traitement se fait dans rtsp_task
+  
+  // Vérifier si le thread RTSP est toujours en vie
+  if (rtsp_running_ && rtsp_task_handle_ == nullptr) {
+    ESP_LOGE(TAG, "RTSP task died unexpectedly, restarting...");
+    setup();
+  }
+}
 
-  std::vector<uint8_t> jpeg_data;
-  if (!fetch_jpeg(jpeg_data)) {
-    ESP_LOGW(TAG, "Failed to fetch JPEG frame");
+void VideoCamera::dump_config() {
+  ESP_LOGCONFIG(TAG, "RTSP Video Camera:");
+  ESP_LOGCONFIG(TAG, "  URL: %s", url_.c_str());
+  ESP_LOGCONFIG(TAG, "  FPS: %d", fps_);
+}
+
+// Tâche RTSP qui s'exécute en parallèle
+void VideoCamera::rtsp_task(void *parameter) {
+  RtspTaskData *data = static_cast<RtspTaskData *>(parameter);
+  VideoCamera *camera = data->camera;
+  
+  ESP_LOGI(TAG, "RTSP task started");
+  
+  // Configuration du client HTTP pour le flux RTSP (version simplifiée)
+  esp_http_client_config_t config = {};
+  config.url = camera->get_url().c_str();
+  config.method = HTTP_METHOD_GET;
+  config.timeout_ms = 10000;
+  
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
+    ESP_LOGE(TAG, "Failed to initialize HTTP client");
+    delete data;
+    camera->rtsp_running_ = false;
+    vTaskDelete(NULL);
     return;
   }
-
-  render_jpeg(jpeg_data);
-}
-
-bool VideoCamera::fetch_jpeg(std::vector<uint8_t> &jpeg_data) {
-  static constexpr uint8_t SOI[] = {0xFF, 0xD8};
-  static constexpr uint8_t EOI[] = {0xFF, 0xD9};
-  uint8_t buffer[1024];
-  jpeg_data.clear();
-  bool found_soi = false;
-
-  while (true) {
-    int len = esp_http_client_read(this->http_client_, (char *)buffer, sizeof(buffer));
-    if (len <= 0) break;
-
-    for (int i = 0; i < len - 1; ++i) {
-      if (!found_soi && buffer[i] == SOI[0] && buffer[i + 1] == SOI[1]) {
-        found_soi = true;
-        jpeg_data.insert(jpeg_data.end(), buffer + i, buffer + len);
+  
+  // Boucle principale de récupération des images
+  while (camera->rtsp_running_) {
+    // Limiter la fréquence de récupération des images
+    vTaskDelay(1000 / camera->fps_ / portTICK_PERIOD_MS);
+    
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to open connection to server: %s (%d)", esp_err_to_name(err), err);
+      vTaskDelay(5000 / portTICK_PERIOD_MS);  // Attendre avant de réessayer
+      continue;
+    }
+    
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0) {
+      ESP_LOGW(TAG, "HTTP client fetch headers failed");
+      esp_http_client_close(client);
+      vTaskDelay(5000 / portTICK_PERIOD_MS);  // Attendre avant de réessayer
+      continue;
+    }
+    
+    // Allouer de la mémoire pour l'image
+    uint8_t *buffer = nullptr;
+    #ifdef USE_ESP32
+    buffer = static_cast<uint8_t *>(heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM));
+    #else
+    buffer = static_cast<uint8_t *>(malloc(content_length));
+    #endif
+    
+    if (buffer == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate memory for image buffer");
+      esp_http_client_close(client);
+      vTaskDelay(5000 / portTICK_PERIOD_MS);  // Attendre avant de réessayer
+      continue;
+    }
+    
+    // Lire les données
+    int read_len = 0;
+    int total_read = 0;
+    
+    while (total_read < content_length) {
+      read_len = esp_http_client_read(client, reinterpret_cast<char *>(buffer + total_read), content_length - total_read);
+      if (read_len <= 0) {
+        ESP_LOGW(TAG, "Error reading data: %d", read_len);
         break;
       }
-      if (found_soi) {
-        jpeg_data.insert(jpeg_data.end(), buffer, buffer + len);
-        for (int j = 0; j < len - 1; ++j) {
-          if (buffer[j] == EOI[0] && buffer[j + 1] == EOI[1]) {
-            return true;
-          }
-        }
-        break;
-      }
+      total_read += read_len;
     }
+    
+    esp_http_client_close(client);
+    
+    if (total_read != content_length) {
+      ESP_LOGW(TAG, "Incomplete read: %d/%d", total_read, content_length);
+      free(buffer);
+      continue;
+    }
+    
+    // Libérer l'ancienne mémoire si elle existe
+    if (camera->last_frame_.buffer != nullptr) {
+      free(camera->last_frame_.buffer);
+    }
+    
+    // Mettre à jour la frame
+    camera->last_frame_.buffer = buffer;
+    camera->last_frame_.size = total_read;
+    camera->last_frame_.is_jpeg = true;  // Supposer que c'est du JPEG pour l'instant
+    
+    // Déterminer la taille de l'image (pour un JPEG)
+    // Note: Ceci est une simplification et pourrait ne pas fonctionner pour tous les formats
+    camera->last_frame_.width = 640;  // Valeur par défaut
+    camera->last_frame_.height = 480;  // Valeur par défaut
+    
+    // Appeler les callbacks
+    camera->call_frame_callbacks_();
   }
-  return false;
+  
+  // Nettoyer
+  esp_http_client_cleanup(client);
+  
+  delete data;
+  camera->rtsp_task_handle_ = nullptr;
+  camera->rtsp_running_ = false;
+  
+  ESP_LOGI(TAG, "RTSP task ended");
+  vTaskDelete(NULL);
 }
 
-void VideoCamera::render_jpeg(const std::vector<uint8_t> &jpeg_data) {
-  if (!display_) return;
-  int w = display_->get_width(), h = display_->get_height();
-  size_t rgb_size = w * h * 2;
-  auto *rgb_buf = static_cast<uint8_t *>(heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-
-  if (rgb_buf && jpg2rgb565(jpeg_data.data(), jpeg_data.size(), rgb_buf, JPG_SCALE_AUTO)) {
-    int idx = 0;
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        uint16_t pixel = (rgb_buf[idx + 1] << 8) | rgb_buf[idx];
-        uint8_t r = ((pixel >> 11) & 0x1F) << 3;
-        uint8_t g = ((pixel >> 5) & 0x3F) << 2;
-        uint8_t b = (pixel & 0x1F) << 3;
-        display_->draw_pixel_at(x, y, display::Color(r, g, b));
-        idx += 2;
-      }
-    }
-    display_->update();
-  } else {
-    ESP_LOGE(TAG, "Failed to decode JPEG");
+void VideoCamera::call_frame_callbacks_() {
+  for (auto &callback : frame_callbacks_) {
+    callback(last_frame_);
   }
-  free(rgb_buf);
 }
 
 }  // namespace video_camera

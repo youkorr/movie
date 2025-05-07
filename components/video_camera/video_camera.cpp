@@ -5,7 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "esp_http_client.h"
-#include "esp_camera.h"
+//#include "esp_camera.h"
 #include <algorithm>
 
 #ifdef USE_ESP32

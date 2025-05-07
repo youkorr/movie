@@ -1,24 +1,28 @@
-from esphome.components import display
 import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.const import CONF_ID, CONF_URL, CONF_FPS
+from esphome.components import display, esp32
+
+DEPENDENCIES = ["esp32"]
+CODEOWNERS = ["@esphome/core"]
 
 video_camera_ns = cg.esphome_ns.namespace("video_camera")
 VideoCamera = video_camera_ns.class_("VideoCamera", cg.Component)
 
-CONFIG_SCHEMA = (
-    cg.Schema(
-        {
-            cg.Required("id"): cg.declare_id(VideoCamera),
-            cg.Required("url"): cg.string,
-            cg.Required("display"): cg.use_id(display.DisplayBuffer),
-            cg.Optional("update_interval", default=1000): cg.uint32,
-        }
-    )
-)
+CONFIG_SCHEMA = cv.Schema({
+    cv.GenerateID(): cv.declare_id(VideoCamera),
+    cv.Required(CONF_URL): cv.string,
+    cv.Optional(CONF_FPS, default=1): cv.positive_int,
+}).extend(cv.COMPONENT_SCHEMA)
 
 async def to_code(config):
-    var = cg.new_Pvariable(config["id"])
+    var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    cg.add(var.set_url(config["url"]))
-    cg.add(var.set_update_interval(config["update_interval"]))
-    display_ = await cg.get_variable(config["display"])
-    cg.add(var.set_display(display_))
+    
+    cg.add(var.set_url(config[CONF_URL]))
+    cg.add(var.set_fps(config[CONF_FPS]))
+    
+    # Ajouter les dépendances nécessaires pour la compilation
+    cg.add_library("WiFiClientSecure", None)
+    cg.add_build_flag("-DBOARD_HAS_PSRAM")
+    cg.add_build_flag("-mfix-esp32-psram-cache-issue")

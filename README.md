@@ -1,7 +1,13 @@
 ```
 video_camera:
   id: stream
-  url: http://192.168.1.123:8080/mjpeg
-  display: my_display
-  update_interval: 1000
+  url: rtsp://
+  fps: 1
+
+display_helper:
+  id: rtsp_display
+  camera_id: stream
+  display_id: my_display
+  width: 320
+  height: 240
 ```

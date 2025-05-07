@@ -1,8 +1,7 @@
 #pragma once
-
 #include "esphome/core/component.h"
 #include "esphome/components/display/display_buffer.h"
-#include "video_camera.h"
+#include "esphome/components/video_camera/video_camera.h"  // Chemin corrigé
 
 namespace esphome {
 namespace video_camera {
@@ -31,7 +30,7 @@ class DisplayHelper : public Component {
     }
     
     // S'inscrire aux mises à jour de frame
-    camera_->add_frame_callback([this](const RtspFrame &frame) {
+    camera_->add_frame_callback([this](const CameraFrame &frame) {  // Corrigé: RtspFrame → CameraFrame
       this->on_frame(frame);
     });
     
@@ -44,7 +43,7 @@ class DisplayHelper : public Component {
   uint16_t display_width_{320};  // Valeur par défaut pour ESP32-S3-BOX3
   uint16_t display_height_{240}; // Valeur par défaut pour ESP32-S3-BOX3
   
-  void on_frame(const RtspFrame &frame) {
+  void on_frame(const CameraFrame &frame) {  // Corrigé: RtspFrame → CameraFrame
     if (frame.buffer == nullptr || frame.size == 0) {
       return;
     }
@@ -87,3 +86,4 @@ class DisplayHelper : public Component {
 
 }  // namespace video_camera
 }  // namespace esphome
+

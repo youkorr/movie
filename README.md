@@ -1,4 +1,11 @@
 ```
+external_components:
+  - source:
+      type: git
+      url: https://github.com/youkorr/movie
+    components: [video_camera, display_helper]
+    refresh: 0s 
+
 video_camera:
   id: stream
   url: rtsp://
